@@ -1,0 +1,5 @@
+# Runtime dependencies of the AutoCAD MCP bridge.
+# Install with: <python> -m pip install -r requirements.txt
+pywin32>=306
+mcp>=2.3.0
+python-dotenv>=1.0.0

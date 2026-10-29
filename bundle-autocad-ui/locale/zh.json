@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "AutoCAD 2024 桥接",
+    "description": "一站式托管：拉起并看护驱动本机 AutoCAD 2024 的桥进程，同时把它暴露成 mcp__autocad__* 工具供 Agent 调用。含状态灯、连接参数、实时日志与崩溃自动重启。"
+  }
+}

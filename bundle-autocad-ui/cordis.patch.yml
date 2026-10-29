@@ -1,0 +1,25 @@
+# One bundle, two rows:
+#   1. autocad-bridge — this package's Host/Client halves: owns the Python bridge
+#      process, its settings, status and logs.
+#   2. autocad-mcp    — the shipped MCP client row that turns that bridge's HTTP
+#      endpoint into mcp__autocad__* agent tools.
+# Keep both ports in step: httpPort in the panel config must equal `url` below.
+- insert:
+    - id: autocad-bridge
+      name: '@local/autocad-bridge'
+    - id: autocad-mcp
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: autocad
+        transport: streamable-http
+        url: 'http://127.0.0.1:8770/mcp'
+        # The bridge takes a few seconds to listen, so allow the first attempt to
+        # fail and let the reconnect loop pick it up.
+        failOnStartupError: false
+        # CAD COM calls can stall behind a modal dialog or a large drawing.
+        toolCallTimeoutMs: 120000
+        reconnect:
+          enabled: true
+          initialDelayMs: 1000
+          maxDelayMs: 10000
+          maxAttempts: 60

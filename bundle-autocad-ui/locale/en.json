@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "AutoCAD 2024 Bridge",
+    "description": "All-in-one host: launches and supervises the bridge process that drives the local AutoCAD 2024, and exposes it as mcp__autocad__* tools for the Agent — status light, settings, live logs, and automatic restart on crash."
+  }
+}
