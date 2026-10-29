@@ -1,0 +1,32 @@
+# ---- 开发过程目录（不发布） ----
+# bridge/ 是开发期的脚本试验场：90 多个一次性分析脚本 + 本项目专用的 .venv。
+# 真正随插件发布的桥源码在 bundle-autocad-ui/bridge/，那份才是权威副本。
+/bridge/
+
+# 早期独立打包的 MCP 配置型 bundle，功能已合并进 bundle-autocad-ui，仅留作历史。
+/bundle-autocad-mcp/
+
+# 视觉插件运行时产物
+/.dsh-vision-router/
+
+# ---- 生成物 ----
+/examples/out/
+node_modules/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ---- docs/ 只发布文档与精选图片，其余（图纸、截图、日志、临时文件）全部忽略 ----
+/docs/*
+!/docs/*.md
+!/docs/images/
+
+# AutoCAD 备份与锁文件
+*.bak
+*.dwl
+*.dwl2
+*.tmp
+
+# 截图/日志中间产物
+*.log
