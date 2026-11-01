@@ -98,23 +98,26 @@ One sidebar icon, one full central panel:
 
 ### Steps
 
-1. Clone anywhere:
+1. Install the bundle into your DSH profile. What you install is the `bundle-autocad-ui` subdirectory of this repo, in one command:
+
+   ```powershell
+   dsh plugin --profile web add github:cmm00100/dsh-autocad-bridge#path:/bundle-autocad-ui
+   ```
+
+   To hack on the code instead, clone it and point at the local directory:
 
    ```powershell
    git clone https://github.com/cmm00100/dsh-autocad-bridge.git
-   ```
-
-2. Install the bundle into your DSH profile, pointing at `bundle-autocad-ui`:
-
-   ```powershell
    dsh plugin --profile web add <clone-path>\bundle-autocad-ui
    ```
 
-3. Open **Settings → Plugins** and confirm the `autocad-bridge` row is enabled.
+   The agent can also call `plugin_manager`'s `install_bundle` with the same target.
 
-4. Click the **AutoCAD Bridge** icon in the sidebar, then **Install dependencies**. The plugin creates a virtual environment under `%USERPROFILE%\.dsh\autocad-bridge\`, installs the three dependencies, and starts the bridge.
+2. Open **Settings → Plugins** and confirm the `autocad-bridge` row is enabled.
 
-5. Once the light is green, have the agent call `mcp__autocad__cad_connect`.
+3. Click the **AutoCAD Bridge** icon in the sidebar, then **Install dependencies**. The plugin creates a virtual environment under `%USERPROFILE%\.dsh\autocad-bridge\`, installs the three dependencies, and starts the bridge.
+
+4. Once the light is green, have the agent call `mcp__autocad__cad_connect`.
 
 Settings live in `%USERPROFILE%\.dsh\autocad-bridge\config.json`; the venv sits next to it.
 

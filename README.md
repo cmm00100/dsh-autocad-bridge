@@ -97,25 +97,26 @@ AutoCAD 本身是一个桌面 GUI 程序，没有对外的 HTTP API。想在 Age
 
 ### 步骤
 
-1. 把本仓库克隆到任意位置：
+1. 在 DSH 里安装插件包。装的是本仓库的 `bundle-autocad-ui` 子目录，一条命令即可：
+
+   ```powershell
+   dsh plugin --profile web add github:cmm00100/dsh-autocad-bridge#path:/bundle-autocad-ui
+   ```
+
+   想改代码再调试的话，克隆下来改成本地路径：
 
    ```powershell
    git clone https://github.com/cmm00100/dsh-autocad-bridge.git
-   ```
-
-2. 在 DSH 里安装插件包（指向 `bundle-autocad-ui` 目录）：
-
-   让 Agent 执行 `plugin_manager` 的 `install_bundle`，或直接在 profile 里装：
-
-   ```powershell
    dsh plugin --profile web add <克隆路径>\bundle-autocad-ui
    ```
 
-3. 打开 **设置 → 插件**，确认 `autocad-bridge` 这一行是**启用**状态。
+   也可以让 Agent 调用 `plugin_manager` 的 `install_bundle`，参数同上。
 
-4. 点击侧边栏的 **AutoCAD 桥接** 图标，点 **安装依赖**。插件会在 `%USERPROFILE%\.dsh\autocad-bridge\` 下建虚拟环境并装好三个依赖，然后自动启动桥进程。
+2. 打开 **设置 → 插件**，确认 `autocad-bridge` 这一行是**启用**状态。
 
-5. 状态灯变绿后，让 Agent 执行 `mcp__autocad__cad_connect`，即可开始画图。
+3. 点击侧边栏的 **AutoCAD 桥接** 图标，点 **安装依赖**。插件会在 `%USERPROFILE%\.dsh\autocad-bridge\` 下建虚拟环境并装好三个依赖，然后自动启动桥进程。
+
+4. 状态灯变绿后，让 Agent 执行 `mcp__autocad__cad_connect`，即可开始画图。
 
 配置文件落在 `%USERPROFILE%\.dsh\autocad-bridge\config.json`，虚拟环境在同目录的 `.venv`。
 
