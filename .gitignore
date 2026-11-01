@@ -3,9 +3,6 @@
 # 真正随插件发布的桥源码在 bundle-autocad-ui/bridge/，那份才是权威副本。
 /bridge/
 
-# 早期独立打包的 MCP 配置型 bundle，功能已合并进 bundle-autocad-ui，仅留作历史。
-/bundle-autocad-mcp/
-
 # 视觉插件运行时产物
 /.dsh-vision-router/
 
