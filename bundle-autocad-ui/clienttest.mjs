@@ -63,7 +63,7 @@ const assert = (condition, message) => {
 }
 
 assert(loaded && typeof loaded.factory === 'function', 'loader received a factory')
-assert(loaded.id === '@local/autocad-bridge', `module id is ${loaded.id}`)
+assert(loaded.id === 'dsh-autocad-bridge', `module id is ${loaded.id}`)
 
 const module = loaded.factory((name) => {
   calls.push(['require', name])

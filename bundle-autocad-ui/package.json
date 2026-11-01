@@ -1,9 +1,21 @@
 {
-  "name": "@local/autocad-bridge",
+  "name": "dsh-autocad-bridge",
   "version": "1.0.0",
-  "private": true,
   "type": "module",
   "description": "AutoCAD 2024 bridge: hosts the Python COM/MCP bridge process and exposes it as agent tools — lifecycle, settings, status and live logs.",
+  "keywords": [
+    "dsh-plugin",
+    "autocad",
+    "cad",
+    "com",
+    "mcp"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cmm00100/dsh-autocad-bridge.git"
+  },
+  "homepage": "https://github.com/cmm00100/dsh-autocad-bridge/tree/main/bundle-autocad-ui",
+  "license": "MIT",
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",

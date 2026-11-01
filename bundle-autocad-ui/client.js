@@ -6,7 +6,7 @@
  * used for colour; all markup and behaviour are local to this package.
  */
 window.__ModuleLoader__.load({
-  id: '@local/autocad-bridge',
+  id: 'dsh-autocad-bridge',
   factory(require) {
     const React = require('react')
     const h = React.createElement

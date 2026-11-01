@@ -6,7 +6,7 @@
 # Keep both ports in step: httpPort in the panel config must equal `url` below.
 - insert:
     - id: autocad-bridge
-      name: '@local/autocad-bridge'
+      name: 'dsh-autocad-bridge'
     - id: autocad-mcp
       name: '@deepseek-ai/dsh-mcp-client'
       config:

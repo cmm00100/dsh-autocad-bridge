@@ -21,7 +21,7 @@ AutoCAD is a desktop GUI with no HTTP API. Driving it from an agent needs a laye
 │                    ▼                                         │
 │   @deepseek-ai/dsh-mcp-client  ── HTTP/SSE ──┐               │
 │                                             │               │
-│   @local/autocad-bridge (this repo) ◄───────┼── control panel │
+│   dsh-autocad-bridge (this repo) ◄─────────┼── control panel │
 │     · owns the Python bridge process         │   start/stop  │
 │     · persists settings · auto-restarts      │   settings    │
 │                                              │   live logs   │
