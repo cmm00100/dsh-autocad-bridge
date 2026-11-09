@@ -115,5 +115,6 @@ def _on_com(self, fn):
 | 宿主逻辑 | `bundle-autocad-ui/selftest.mjs` | 9 步：起进程、探端口、读日志、存配置、停进程 |
 | 看护逻辑 | `bundle-autocad-ui/watchdogtest.mjs` | 意外退出重启、主动停止不重启、退避阶梯 |
 | 可移植性 | `bundle-autocad-ui/findtest.mjs` | 路径发现、配置迁移、外部目录降级 |
+| 跨版本兼容 | `tests/test_backward_compat.py` | 32 项：同一张图纸混调 V1.0/V1.1/V1.2/V1.3 工具，验证旧工具在 3D+视口之后仍可用、早期图元不被改写 |
 
 **没有覆盖到的**：面板的真实像素渲染。原因见 [限制](limitations.md)。

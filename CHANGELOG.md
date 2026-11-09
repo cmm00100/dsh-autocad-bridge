@@ -10,6 +10,14 @@ full backward compatibility with tools shipped in earlier versions.
 
 ## [Unreleased]
 
+### Added
+- `tests/test_backward_compat.py`: a durable, status-independent 32-assertion
+  regression that interleaves V1.0/V1.1/V1.2/V1.3 tools on one drawing and
+  verifies the oldest tools still work after 3D modelling + viewport change.
+  Passing an explicit `layer="0"` in Phase A removes the previous cold-start
+  dependency (the `auto_layer_by_kind` switch is process-global), so the test
+  is repeatable against a warm bridge. Recorded in `docs/architecture.md`.
+
 ## [1.3.0] - 2026-11-09
 
 V1.3 「2D 转 3D、参数化实体建模」。工具数从 56 增至 **70**（新增 14 个
