@@ -419,3 +419,81 @@ s.Delete()
 CAD 后台收尾会忙 2~5 秒。V1.2 给 `_call` 加了可选 `retries / retry_delay_s /
 timeout_s` 覆盖，**仅 `batch_convert`** 用 `12×0.6s + 180s`；不传时行为与
 V1.1 完全一致（向下兼容）。
+
+## V1.3 补充：3D 实体建模与视图切换的实测语义
+
+### 原语的 center 是几何中心，角度一律弧度
+
+`AddBox(center, L, W, H)` / `AddCylinder(center, r, h)` 等 7 种原语的
+`center` 是**几何中心**（沿 Z 对称）：`AddBox(P(0,0,0),10,20,30)` 的包围盒是
+`(-5,-10,-15)..(5,10,15)`，不是 `(0,0,0)..(10,20,30)`。要把 box 放到
+`[0,L]×[0,W]×[0,H]`，center 必须传 `(L/2, W/2, H/2)`（`dimensions_to_3d`
+正是这么做的）。`Rotate3D` / `AddRevolvedSolid` / `AddDimRotated` 的角度都是
+**弧度**；对外工具参数一律用度，内部 `math.radians()`。
+
+### 面域会被建模消耗，且 AddRegion 返回 tuple
+
+```
+pl = ms.AddLightWeightPolyline(dbl_array([...]))
+pl.Closed = True                              # 默认 False，必须显式设
+regions = ms.AddRegion(VARIANT(VT_ARRAY|VT_DISPATCH, [pl]))   # 返回 tuple，取 regions[0]
+solid = ms.AddExtrudedSolid(regions[0], height, taper_rad)
+```
+
+`AddRegion` 返回的是 **tuple**（实测长度 1），元素是 `AcDbRegion`。**每次**
+拉伸/旋转/扫掠都会消耗传入的面域，所以生产代码用 `_closed_region()` 每次
+重新建一个面域，不能复用。`AddExtrudedSolidAlongPath(region, path)` 的
+`path` 可以是 `AcDbLine`（实测圆面域 + 直线路径 → 圆柱）。
+
+### Boolean 编码与文档相反、交集为空会删掉双方
+
+`Boolean(operation, other)`：`0=并集 / 1=交集 / 2=差集`（**与 COM 文档相反**），
+`3/4` 报「参数 Operation 无效」。交集为空时**两个对象一起被删**，判断存活
+不能读 `Handle`（被删对象读 Handle 有时不报错），要立刻读 `GetBoundingBox()`
+（被删必抛 com_error）。`solid.MassProperties` 在本版本不可用，体积校验走不通，
+`solid_info` 用包围盒代替。
+
+### 没有 Fillet/Chamfer/Sweep/Loft 实体方法
+
+全库 grep 零命中。圆角/倒角只能走命令，且是 fire-and-forget（异步、无法读回
+验证，需在 CAD 里目视确认）：
+
+```python
+doc.SendCommand("_.FILLETEDGE\n_Radius\n3.0\n_All\n\n")
+doc.SendCommand("_.CHAMFEREDGE\n_Distance\n3.0\n3.0\n_All\n\n")
+time.sleep(0.6)
+```
+
+扫掠用 `AddExtrudedSolidAlongPath` 而不是 Sweep。
+
+### 视图方向：ActiveViewport 是副本，必须赋值回
+
+```
+vp = dynamic.Dispatch(doc.ActiveViewport)
+vp.Direction = VARIANT(VT_ARRAY|VT_R8, [x, y, z])
+doc.ActiveViewport = vp            # ← 只改 vp 不赋值回，VIEWDIR 不变
+```
+
+`doc.ActiveViewport` 属性返回的是**副本**：只改 `vp.Direction`，读 `vp.Direction`
+是新值但 `GetVariable("VIEWDIR")` 仍是 `(0,0,1)`；赋值回后四个方向
+（iso `(1,-1,1)` / front `(0,-1,0)` / top `(0,0,1)` / right `(1,0,0)`）全部
+`vp == VIEWDIR` 同步。验证统一用 **`VIEWDIR`（可读）**；`VPOINT` /
+`VSCURRENT` 两个变量 `GetVariable`/`SetVariable` 都报
+`com_error ... 设置系统变量时出错 ... -2145320858 / -2145320859`（不可用）。
+视觉样式只能 `doc.SendCommand("_.VSCURRENT\n_Conceptual\n")`，**无法读回**。
+`probe_v13d.py` 曾因发裸 `-VPOINT` 命令让 AutoCAD 停在交互提示、COM 全被拒，
+**生产代码绝不发裸 VPOINT**。方向向量表见 `cad_com.py` 的 `_view_direction`。
+
+### 建模 / 改视口 / 发命令必须拆成独立 _call
+
+一句话方法若在同一个 `_call` 里既 `AddBox` 又 `SendCommand("_.VSCURRENT…")`，
+会触发：
+
+```
+(-2147352567, '发生意外。', (0, 'AutoCAD.Application', '对象已打开进行通知',
+ 'D:\Autodesk\AutoCAD 2024\HELP\OLE_ERR.CHM', -2145386414, -2145386414), None)
+```
+
+新建对象还开着通知时 CAD 不派发命令。定稿配方：`_apply_view()` 只做纯 COM
+方向切换，`_view_and_shade()` 把「方向」与「VSCURRENT」各用一次 `_call` 隔离，
+一句话方法 = 建模 `_call` → 再 `_view_and_shade`。

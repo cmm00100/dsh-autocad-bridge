@@ -2428,6 +2428,473 @@ class CadBridge:
         return {"ok": True, "out_dir": os.path.abspath(out_dir), "formats": fmts,
                 "succeeded": ok, "failed": len(results) - ok, "results": results}
 
+    # -- V1.3 3D 建模 / 2D→3D / 视图 --------------------------------------
+    #
+    # 全部配方都来自 live probe（bridge/probe_v13*.py），关键结论：
+    #   * 坐标参数是 SAFEARRAY(double) → 一律 _pt / dbl_array。
+    #   * AddRegion 的对象参数是 SAFEARRAY(VT_DISPATCH)。
+    #   * 面域会被 AddExtrudedSolid/AddRevolvedSolid/AddExtrudedSolidAlongPath
+    #     消耗，所以每次拉伸/旋转/扫掠都要用 _closed_region 建全新面域。
+    #   * center 是几何中心（沿 Z 对称），不是底心。
+    #   * 旋转/锥度/角度参数是弧度，对外一律用度，内部 math.radians。
+    #   * Boolean 0=并 / 1=交 / 2=差（与文档相反）；交集为空时双方一起被删。
+    #   * 视图方向改完必须 doc.ActiveViewport = vp 赋值回，否则不生效；
+    #     用 GetVariable("VIEWDIR") 验证，不要用 VPOINT/VSCURRENT（不可读）。
+    #   * 全库无 Chamfer/Fillet/Sweep/Loft 实体方法：倒角/圆角走 SendCommand，
+    #     扫掠走 AddExtrudedSolidAlongPath。
+
+    @staticmethod
+    def _dispatch_array(objects: Sequence[Any]) -> Any:
+        """SAFEARRAY(VT_DISPATCH)：AddRegion 等需要「对象数组」而非点数组。"""
+        return VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH, list(objects))
+
+    @staticmethod
+    def _obj_by_handle(doc: Any, handle: str) -> Any:
+        """按句柄取回对象并 dynamic.Dispatch（避免 IAcadEntity 窄化）。"""
+        try:
+            return dynamic.Dispatch(doc.HandleToObject(str(handle)))
+        except Exception as exc:  # noqa: BLE001
+            raise CadError(f"找不到句柄 '{handle}' 对应的对象：{exc}")
+
+    @staticmethod
+    def _view_direction(name: str) -> tuple[float, float, float]:
+        table = {
+            "iso": (1.0, -1.0, 1.0), "isometric": (1.0, -1.0, 1.0),
+            "front": (0.0, -1.0, 0.0), "back": (0.0, 1.0, 0.0),
+            "top": (0.0, 0.0, 1.0), "bottom": (0.0, 0.0, -1.0),
+            "right": (1.0, 0.0, 0.0), "left": (-1.0, 0.0, 0.0),
+        }
+        key = str(name).lower()
+        if key not in table:
+            raise CadError(f"未知视图 '{name}'。可选：{', '.join(sorted(table))}")
+        return table[key]
+
+    def _closed_region(self, ms: Any, points: Sequence[Sequence[float]]) -> Any:
+        """由闭合 2D 轮廓建一个全新面域（每次建模都要新建，面域会被消耗）。"""
+        flat: list[float] = []
+        for p in points:
+            flat.extend([float(p[0]), float(p[1])])
+        if len(flat) < 6:
+            raise CadError("轮廓至少需要 3 个点。")
+        pl = ms.AddLightWeightPolyline(dbl_array(flat))
+        pl.Closed = True  # 读回初始是 False，必须显式设
+        regions = ms.AddRegion(self._dispatch_array([pl]))
+        try:
+            return regions[0]
+        except Exception:  # noqa: BLE001
+            return regions
+
+    def _apply_view(self, doc: Any, view: str, zoom: bool = True) -> dict[str, Any]:
+        """在 _do() 里调用：改 ActiveViewport 并验证 VIEWDIR（纯 COM，不发裸 VPOINT）。
+
+        只做「纯 COM 方向切换」，不碰 SendCommand —— 视觉样式由 _view_and_shade
+        单独一次 _call 处理，避免与建模/改视口挤在同一 COM 调用里。
+        """
+        d = self._view_direction(view)
+        vp = dynamic.Dispatch(doc.ActiveViewport)
+        vp.Direction = dbl_array(list(d))
+        doc.ActiveViewport = vp  # ★ 赋值回，否则只改了副本
+        if zoom:
+            self._safe(lambda: self._app.ZoomExtents(), default=None)
+        vd = self._safe(
+            lambda: tuple(round(float(x), 4) for x in doc.GetVariable("VIEWDIR")),
+            default=None,
+        )
+        want = tuple(round(x, 4) for x in d)
+        return {"view": str(view).lower(), "direction": list(d), "viewdir": vd,
+                "verified": vd == want}
+
+    def _view_and_shade(self, view: str, shade: str, doc_name: str | None) -> dict[str, Any]:
+        """切视图 + 着色，两件事各用一次 _call 彻底隔离。
+
+        实测坑：把「建模」或「改 ActiveViewport」与 doc.SendCommand 挤进同一个
+        COM 调用会触发 (-2145386414, '对象已打开进行通知')。所以方向（纯 COM）
+        一次 _call、VSCURRENT 命令另一次 _call，互不同步执行。
+        """
+        info = self._call(
+            f"切 3D 视图 {view}",
+            lambda: self._apply_view(self._document(doc_name), view, zoom=True),
+        )
+        shade_sent = False
+        if shade:
+            def _shade():
+                doc = self._document(doc_name)
+                doc.SendCommand(f"_.VSCURRENT\n_{shade}\n")
+                time.sleep(0.4)
+                return True
+            self._call(f"设置视觉样式 {shade}", _shade)
+            shade_sent = True
+        return {**info, "shade": shade or None, "shade_sent": shade_sent}
+
+    # ---- V1.3-1 3D 原生能力 ----------------------------------------------
+
+    def add_3d_primitive(
+        self,
+        kind: str,
+        center: Sequence[float] = (0.0, 0.0, 0.0),
+        params: dict[str, Any] | None = None,
+        layer: str | None = None,
+        doc_name: str | None = None,
+    ) -> dict[str, Any]:
+        """7 种 3D 原语。center 是几何中心（沿 Z 对称），不是底心。
+
+        kind / params：
+          box      {length, width, height}
+          cylinder {radius, height}
+          sphere   {radius}
+          cone     {radius, height}
+          torus    {torus_radius, tube_radius}
+          wedge    {length, width, height}
+        """
+        k = str(kind).lower()
+        pr = dict(params or {})
+        c = [float(center[0]), float(center[1]),
+             float(center[2]) if len(center) >= 3 else 0.0]
+        layer = self._layer_for(layer, "outline")
+        if layer:
+            self.ensure_layer(layer, doc_name=doc_name)
+
+        def _num(*names, default=0.0):
+            for n in names:
+                if n in pr and pr[n] is not None:
+                    return float(pr[n])
+            return float(default)
+
+        def _do():
+            ms = self._document(doc_name).ModelSpace
+            p = _pt(*c)
+            if k == "box":
+                ent = ms.AddBox(p, _num("length", "l", default=10),
+                                _num("width", "w", default=10), _num("height", "h", default=10))
+            elif k == "cylinder":
+                ent = ms.AddCylinder(p, _num("radius", "r", default=5),
+                                     _num("height", "h", default=10))
+            elif k == "sphere":
+                ent = ms.AddSphere(p, _num("radius", "r", default=5))
+            elif k == "cone":
+                ent = ms.AddCone(p, _num("radius", "r", default=5),
+                                 _num("height", "h", default=10))
+            elif k == "torus":
+                ent = ms.AddTorus(p, _num("torus_radius", "tr", default=10),
+                                  _num("tube_radius", "r", default=3))
+            elif k == "wedge":
+                ent = ms.AddWedge(p, _num("length", "l", default=10),
+                                  _num("width", "w", default=10), _num("height", "h", default=10))
+            else:
+                raise CadError(f"未知 3D 原语 '{kind}'。可选：box/cylinder/sphere/cone/torus/wedge")
+            d = dynamic.Dispatch(ent)
+            if layer:
+                d.Layer = layer
+            return {"handle": str(d.Handle), "object_name": str(d.ObjectName),
+                    "bbox": _bbox_summary(d), "kind": k, "center": c, "params": pr}
+
+        info = self._call(f"建 3D 原语 {k}", _do)
+        return {"ok": True, **info, "layer": layer, "document": self._last_doc_name}
+
+    def extrude_profile(
+        self,
+        points: Sequence[Sequence[float]],
+        height: float = 10.0,
+        taper_deg: float = 0.0,
+        layer: str | None = None,
+        doc_name: str | None = None,
+    ) -> dict[str, Any]:
+        """闭合 2D 轮廓 → 面域 → 拉伸实体（同时是 V1.3-2 的自动厚度核心）。"""
+        layer = self._layer_for(layer, "outline")
+        if layer:
+            self.ensure_layer(layer, doc_name=doc_name)
+
+        def _do():
+            ms = self._document(doc_name).ModelSpace
+            region = self._closed_region(ms, points)  # 每次新建，面域会被消耗
+            solid = ms.AddExtrudedSolid(region, float(height), math.radians(float(taper_deg)))
+            d = dynamic.Dispatch(solid)
+            if layer:
+                d.Layer = layer
+            return {"handle": str(d.Handle), "object_name": str(d.ObjectName),
+                    "bbox": _bbox_summary(d), "height": float(height), "taper_deg": float(taper_deg)}
+
+        info = self._call("拉伸轮廓", _do)
+        return {"ok": True, "type": "extruded_solid", **info,
+                "layer": layer, "document": self._last_doc_name}
+
+    def revolve_profile(
+        self,
+        points: Sequence[Sequence[float]],
+        axis_point: Sequence[float] = (0.0, 0.0, 0.0),
+        axis_dir: Sequence[float] = (0.0, 1.0, 0.0),
+        angle_deg: float = 360.0,
+        layer: str | None = None,
+        doc_name: str | None = None,
+    ) -> dict[str, Any]:
+        """闭合 2D 轮廓绕轴旋转成实体；angle_deg 用度，轴方向是向量。"""
+        layer = self._layer_for(layer, "outline")
+        if layer:
+            self.ensure_layer(layer, doc_name=doc_name)
+        ap = _pt(*[float(v) for v in axis_point[:3]])
+        ad = _pt(*[float(v) for v in axis_dir[:3]])
+
+        def _do():
+            ms = self._document(doc_name).ModelSpace
+            region = self._closed_region(ms, points)
+            solid = ms.AddRevolvedSolid(region, ap, ad, math.radians(float(angle_deg)))
+            d = dynamic.Dispatch(solid)
+            if layer:
+                d.Layer = layer
+            return {"handle": str(d.Handle), "object_name": str(d.ObjectName),
+                    "bbox": _bbox_summary(d), "angle_deg": float(angle_deg),
+                    "axis_point": list(axis_point[:3]), "axis_dir": list(axis_dir[:3])}
+
+        info = self._call("旋转轮廓", _do)
+        return {"ok": True, "type": "revolved_solid", **info,
+                "layer": layer, "document": self._last_doc_name}
+
+    def sweep_profile(
+        self,
+        points: Sequence[Sequence[float]],
+        path_start: Sequence[float] = (0.0, 0.0, 0.0),
+        path_end: Sequence[float] = (0.0, 0.0, 80.0),
+        layer: str | None = None,
+        doc_name: str | None = None,
+    ) -> dict[str, Any]:
+        """闭合轮廓沿直线路径扫掠成实体（AddExtrudedSolidAlongPath）。"""
+        layer = self._layer_for(layer, "outline")
+        if layer:
+            self.ensure_layer(layer, doc_name=doc_name)
+        ps = _pt(*[float(v) for v in path_start[:3]])
+        pe = _pt(*[float(v) for v in path_end[:3]])
+
+        def _do():
+            ms = self._document(doc_name).ModelSpace
+            path = ms.AddLine(ps, pe)  # 实测：AcDbLine 可作扫掠路径
+            region = self._closed_region(ms, points)
+            solid = ms.AddExtrudedSolidAlongPath(region, path)
+            d = dynamic.Dispatch(solid)
+            if layer:
+                d.Layer = layer
+            return {"handle": str(d.Handle), "object_name": str(d.ObjectName),
+                    "bbox": _bbox_summary(d), "path_start": list(path_start[:3]),
+                    "path_end": list(path_end[:3])}
+
+        info = self._call("沿路径扫掠", _do)
+        return {"ok": True, "type": "swept_solid", **info,
+                "layer": layer, "document": self._last_doc_name}
+
+    def boolean_solids(
+        self,
+        handle1: str,
+        handle2: str,
+        operation: str = "union",
+        doc_name: str | None = None,
+    ) -> dict[str, Any]:
+        """布尔运算：union(0) / intersect(1) / subtract(2)。结果留在 handle1。
+
+        注意：交集为空时 COM 会把双方一起删掉；用返回的 bbox 是否为空判断存活。
+        """
+        op_map = {"union": 0, "intersect": 1, "subtract": 2,
+                  "0": 0, "1": 1, "2": 2}
+        key = str(operation).lower()
+        if key not in op_map:
+            raise CadError(f"未知布尔运算 '{operation}'。可选：union/intersect/subtract")
+        op = op_map[key]
+
+        def _do():
+            doc = self._document(doc_name)
+            a = self._obj_by_handle(doc, handle1)
+            b = self._obj_by_handle(doc, handle2)
+            a.Boolean(op, b)
+            bbox = _bbox_summary(a)
+            return {"handle": handle1, "operation": key, "op_code": op,
+                    "bbox": bbox, "survived": bool(bbox)}
+
+        info = self._call(f"布尔 {key}", _do)
+        return {"ok": True, **info, "document": self._last_doc_name}
+
+    def rotate_3d(
+        self,
+        handle: str,
+        axis_point1: Sequence[float] = (0.0, 0.0, 0.0),
+        axis_point2: Sequence[float] = (1.0, 0.0, 0.0),
+        angle_deg: float = 90.0,
+        doc_name: str | None = None,
+    ) -> dict[str, Any]:
+        """实体绕 3D 轴旋转；angle_deg 用度（COM 内部是弧度）。"""
+        p1 = _pt(*[float(v) for v in axis_point1[:3]])
+        p2 = _pt(*[float(v) for v in axis_point2[:3]])
+
+        def _do():
+            ent = self._obj_by_handle(self._document(doc_name), handle)
+            ent.Rotate3D(p1, p2, math.radians(float(angle_deg)))
+            return {"handle": handle, "bbox": _bbox_summary(ent), "angle_deg": float(angle_deg)}
+
+        info = self._call("3D 旋转", _do)
+        return {"ok": True, **info, "document": self._last_doc_name}
+
+    def slice_solid(
+        self,
+        handle: str,
+        p1: Sequence[float],
+        p2: Sequence[float],
+        p3: Sequence[float],
+        negative: bool = False,
+        doc_name: str | None = None,
+    ) -> dict[str, Any]:
+        """用三点定义的平面把实体切成两半，返回新实体。"""
+        a, b, c = (_pt(*[float(v) for v in p[:3]]) for p in (p1, p2, p3))
+
+        def _do():
+            ent = self._obj_by_handle(self._document(doc_name), handle)
+            new = ent.SliceSolid(a, b, c, bool(negative))
+            d = dynamic.Dispatch(new)
+            return {"handle": str(d.Handle), "object_name": str(d.ObjectName),
+                    "bbox": _bbox_summary(d), "negative": bool(negative)}
+
+        info = self._call("剖切实体", _do)
+        return {"ok": True, **info, "document": self._last_doc_name}
+
+    def section_solid(
+        self,
+        handle: str,
+        p1: Sequence[float],
+        p2: Sequence[float],
+        p3: Sequence[float],
+        doc_name: str | None = None,
+    ) -> dict[str, Any]:
+        """用三点定义的平面取实体截面，返回面域（AcDbRegion）。"""
+        a, b, c = (_pt(*[float(v) for v in p[:3]]) for p in (p1, p2, p3))
+
+        def _do():
+            ent = self._obj_by_handle(self._document(doc_name), handle)
+            region = ent.SectionSolid(a, b, c)
+            d = dynamic.Dispatch(region)
+            return {"handle": str(d.Handle), "object_name": str(d.ObjectName),
+                    "bbox": _bbox_summary(d)}
+
+        info = self._call("取实体截面", _do)
+        return {"ok": True, **info, "document": self._last_doc_name}
+
+    def fillet_edges(self, radius: float = 3.0, doc_name: str | None = None) -> dict[str, Any]:
+        """实体圆角：走 _.FILLETEDGE 命令（COM 无 Fillet 方法）。
+
+        这是 fire-and-forget：命令异步执行、无法读回验证。请在 CAD 里目视确认；
+        需要保证几何时用 cad_send_command 发自己的命令串，或改用布尔建模。
+        """
+
+        def _do():
+            doc = self._document(doc_name)
+            doc.SendCommand(f"_.FILLETEDGE\n_Radius\n{float(radius)}\n_All\n\n")
+            time.sleep(0.6)
+            return {"sent": True, "radius": float(radius),
+                    "note": "已发送 FILLETEDGE（异步，无法读回验证，请在 CAD 里确认）"}
+
+        info = self._call("实体圆角", _do)
+        return {"ok": True, **info, "document": self._last_doc_name}
+
+    def chamfer_edges(self, dist1: float = 3.0, dist2: float = 3.0,
+                      doc_name: str | None = None) -> dict[str, Any]:
+        """实体倒角：走 _.CHAMFEREDGE 命令（COM 无 Chamfer 方法）。fire-and-forget。"""
+
+        def _do():
+            doc = self._document(doc_name)
+            doc.SendCommand(f"_.CHAMFEREDGE\n_Distance\n{float(dist1)}\n{float(dist2)}\n_All\n\n")
+            time.sleep(0.6)
+            return {"sent": True, "dist1": float(dist1), "dist2": float(dist2),
+                    "note": "已发送 CHAMFEREDGE（异步，无法读回验证，请在 CAD 里确认）"}
+
+        info = self._call("实体倒角", _do)
+        return {"ok": True, **info, "document": self._last_doc_name}
+
+    def solid_info(self, handle: str, doc_name: str | None = None) -> dict[str, Any]:
+        """读实体包围盒 / 图层 / 存活状态。MassProperties 不可用，用 bbox 代替。"""
+
+        def _do():
+            ent = self._obj_by_handle(self._document(doc_name), handle)
+            d = dynamic.Dispatch(ent)
+            bbox = _bbox_summary(d)
+            return {"handle": handle, "object_name": str(d.ObjectName),
+                    "bbox": bbox, "alive": bool(bbox),
+                    "layer": self._safe(lambda: str(d.Layer), default=""),
+                    "note": "MassProperties 在此 COM 接口不可用，体积/质心请用 bbox 推断"}
+
+        info = self._call("读实体信息", _do)
+        return {"ok": True, **info, "document": self._last_doc_name}
+
+    # ---- V1.3-3 视图 ------------------------------------------------------
+
+    def set_3d_view(
+        self,
+        view: str = "iso",
+        shade: str = "",
+        doc_name: str | None = None,
+    ) -> dict[str, Any]:
+        """切 3D 视图：iso/front/back/top/bottom/right/left。
+
+        方向用纯 COM 的 ActiveViewport.Direction（必须赋值回 doc.ActiveViewport），
+        用 GetVariable("VIEWDIR") 验证；shade 走 _.VSCURRENT 命令（异步，不可读回）。
+        """
+
+        info = self._view_and_shade(view, shade, doc_name)
+        info["regen"] = False
+        return {"ok": True, **info, "document": self._last_doc_name}
+
+    # ---- V1.3-2 一句话：尺寸/轮廓 → 3D 模型 -------------------------------
+
+    def dimensions_to_3d(
+        self,
+        length: float,
+        width: float,
+        height: float,
+        shade: str = "Conceptual",
+        layer: str | None = None,
+        doc_name: str | None = None,
+    ) -> dict[str, Any]:
+        """「一句话」：输入零件长宽高 → box 实体 + 等轴测视图 + 着色。"""
+        L, W, H = float(length), float(width), float(height)
+        layer = self._layer_for(layer, "outline")
+        if layer:
+            self.ensure_layer(layer, doc_name=doc_name)
+
+        def _do():
+            ms = self._document(doc_name).ModelSpace
+            # center 是几何中心 → 让 box 占据 [0,L]×[0,W]×[0,H]
+            ent = ms.AddBox(_pt(L / 2.0, W / 2.0, H / 2.0), L, W, H)
+            d = dynamic.Dispatch(ent)
+            if layer:
+                d.Layer = layer
+            return {"handle": str(d.Handle), "object_name": str(d.ObjectName),
+                    "bbox": _bbox_summary(d), "dimensions": [L, W, H]}
+
+        geom = self._call("由尺寸生成 3D 模型", _do)
+        view = self._view_and_shade("iso", shade, doc_name)
+        return {"ok": True, **geom, **view, "layer": layer, "document": self._last_doc_name}
+
+    def profile_to_3d(
+        self,
+        points: Sequence[Sequence[float]],
+        thickness: float = 10.0,
+        shade: str = "Conceptual",
+        layer: str | None = None,
+        doc_name: str | None = None,
+    ) -> dict[str, Any]:
+        """「一句话」：闭合 2D 草图 + 厚度 → 拉伸实体 + 等轴测视图 + 着色。"""
+        layer = self._layer_for(layer, "outline")
+        if layer:
+            self.ensure_layer(layer, doc_name=doc_name)
+
+        def _do():
+            ms = self._document(doc_name).ModelSpace
+            region = self._closed_region(ms, points)
+            solid = ms.AddExtrudedSolid(region, float(thickness), 0.0)
+            d = dynamic.Dispatch(solid)
+            if layer:
+                d.Layer = layer
+            return {"handle": str(d.Handle), "object_name": str(d.ObjectName),
+                    "bbox": _bbox_summary(d), "thickness": float(thickness)}
+
+        geom = self._call("由草图生成 3D 模型", _do)
+        view = self._view_and_shade("iso", shade, doc_name)
+        return {"ok": True, **geom, **view, "layer": layer, "document": self._last_doc_name}
+
     # -- 读取 --------------------------------------------------------------
 
     def list_entities(self, doc_name: str | None = None, limit: int = 200) -> dict[str, Any]:

@@ -1,12 +1,13 @@
 # DSH AutoCAD Bridge
 
-Give **AutoCAD 2024** to a DeepSeek Harness agent as a pair of hands: query status, draw entities, manage layers, **GB-standard dimensions**, blocks with attributes, MText / geometric tolerances, mechanical aids, xrefs, auto-BOM and **batch DXF/DWG/PDF delivery** — all through MCP tool calls. Ships with a **control panel** that owns the bridge process: start/stop/restart, settings, a status light and live logs.
+Give **AutoCAD 2024** to a DeepSeek Harness agent as a pair of hands: query status, draw entities, manage layers, **GB-standard dimensions**, blocks with attributes, MText / geometric tolerances, mechanical aids, xrefs, auto-BOM, **batch DXF/DWG/PDF delivery** and **3D solid modelling / 2D→3D reasoning** — all through MCP tool calls. Ships with a **control panel** that owns the bridge process: start/stop/restart, settings, a status light and live logs.
 
-**Current version 1.2.0** (V1.2 non-standard automation toolkit): 56 tools,
-one call to batch-organise a whole set of equipment drawings, generate the BOM
-and deliver PDFs; V1.1's "set up the drafting environment + draw + auto-dimension
-+ auto-layer" is also one call. Roadmap: [docs/ROADMAP.md](docs/ROADMAP.md);
-changes: [CHANGELOG.md](CHANGELOG.md).
+**Current version 1.3.0** (V1.3 2D→3D / parametric solid modelling): 70 tools,
+one call to turn part dimensions into a 3D solid with an isometric view;
+V1.2's "batch-organise a whole set of equipment drawings, generate the BOM
+and deliver PDFs" and V1.1's "set up the drafting environment + draw +
+auto-dimension + auto-layer" are also one call each. Roadmap:
+[docs/ROADMAP.md](docs/ROADMAP.md); changes: [CHANGELOG.md](CHANGELOG.md).
 
 > 中文: [README.md](README.md)
 
@@ -66,7 +67,7 @@ One sidebar icon, one full central panel:
 - **Dependency bootstrap** — builds a virtual environment in your data directory and installs pywin32 / mcp / python-dotenv on demand
 - **Discovery** — finds Python and the bridge directory, detects which AutoCAD ProgIDs your machine actually registers
 
-### 56 agent tools
+### 70 agent tools
 
 #### Base (V1.0, 18 — all kept)
 
@@ -151,6 +152,42 @@ cad_unify_styles(style="DSH-CN")  -> bulk-unify fonts / layers
 `cad_batch_convert` gives each document its own STA call, a globally unique
 SelectionSet name, and a wider BUSY retry window (after consecutive exports
 AutoCAD stays busy for 2–5 s); 3 drawings in a row verified 3/3.
+
+#### V1.3 3D loop (14)
+
+| Group | Tool | What it does |
+|---|---|---|
+| Primitives | `cad_add_3d_primitive` | 7 primitives: box/cylinder/sphere/cone/torus/wedge |
+| Modelling | `cad_extrude_profile` | Closed profile -> region -> extruded solid |
+| Modelling | `cad_revolve_profile` | Revolve a closed profile about an axis |
+| Modelling | `cad_sweep_profile` | Sweep a closed profile along a line path |
+| Modelling | `cad_boolean_solids` | Union / intersect / subtract |
+| Modelling | `cad_rotate_3d` | Rotate a solid about a 3D axis |
+| Modelling | `cad_slice_solid` | Slice a solid with a 3-point plane |
+| Modelling | `cad_section_solid` | Section (region) of a solid |
+| Modelling | `cad_solid_info` | Bounding box / layer / liveness |
+| Modelling | `cad_fillet_edges` / `cad_chamfer_edges` | Fillet / chamfer (command, async) |
+| Views | `cad_set_3d_view` | iso/front/back/top/bottom/right/left + shade |
+| 2D→3D | `cad_dimensions_to_3d` | **Dimensions -> solid + isometric + shade** |
+| 2D→3D | `cad_profile_to_3d` | **Closed sketch + thickness -> solid + isometric + shade** |
+
+#### One call from dimensions to a 3D model
+
+```
+cad_dimensions_to_3d(length=44, width=28, height=40)
+    -> box occupying [0,44]x[0,28]x[0,40] + auto isometric + Conceptual shade
+cad_profile_to_3d(points=[[0,0],[60,0],[60,40],[0,40]], thickness=12)
+    -> extruded solid + auto isometric + shade
+cad_set_3d_view(view="front", shade="Realistic")  -> switch to front view
+```
+
+Measured facts: a primitive's `center` is the **geometric centre** (symmetric in
+Z), `Boolean` is `0=union / 1=intersect / 2=subtract` (**opposite to the docs**),
+all 3D angle arguments are **degrees** (radians inside COM). `cad_fillet_edges`
+/ `cad_chamfer_edges` go through `_.FILLETEDGE` / `_.CHAMFEREDGE` commands and
+are fire-and-forget — verify visually in CAD. View direction is changed with
+pure COM on `ActiveViewport.Direction` **assigned back**, then verified with
+`VIEWDIR`; no bare `VPOINT` command is ever sent.
 
 #### One call to a part drawing
 

@@ -71,9 +71,23 @@ V1.1 已把标注做成原生工具：线性、对齐、半径、直径、角度
 （`AcDbFcf`）。仍**未实现**的：引线标注（leader）、表面粗糙度符号、焊接
 符号，需要时用 `cad_send_command` 发原生命令。
 
-### 3D 只有构造原语
+### 3D 建模的边界（V1.3）
 
-`AddBox` / `AddCylinder` / `AddSphere` / `AddCone` / `AddTorus` / `AddWedge` 加上 `Boolean` 和 `Rotate3D`。没有放样、扫掠、旋转成体这些高级建模。够用来自造零件，不够用来做曲面造型。
+V1.3 已把 3D 做成原生工具：7 种原语、面域拉伸/旋转/扫掠（`AddExtrudedSolid`
+/ `AddRevolvedSolid` / `AddExtrudedSolidAlongPath`）、布尔并交差、旋转、
+剖切、截面、包围盒读取，外加 `cad_dimensions_to_3d` / `cad_profile_to_3d`
+两句话推理。仍有边界：
+
+- **无放样（Loft）、无曲面造型**。COM 全库没有 `Loft` / `Sweep` / `Fillet`
+  / `Chamfer` 实体方法；倒角圆角走 `_.FILLETEDGE` / `_.CHAMFEREDGE` **命令**，
+  是 fire-and-forget（异步、无法读回验证），需在 CAD 里目视确认。
+- 2D→3D 推理只支持**单一闭合轮廓 + 厚度**（或长宽高 → box）。它不会从三
+  视图反推复杂拓扑、台阶、孔位；「根据三视图自动推理立体结构」仍是 ROADMAP
+  V2.0 的目标。
+- 视觉样式（`VSCURRENT`）只能发命令、不能读回验证；视图方向用 `VIEWDIR`
+  验证，但**渲染效果本身不做视觉检查**。
+- `solid.MassProperties` 在本版本不可用，体积/质量校验走不通，`cad_solid_info`
+  只给包围盒。
 
 ### 没有写入操作的撤销
 
@@ -95,12 +109,12 @@ V1.1 已把标注做成原生工具：线性、对齐、半径、直径、角度
 
 ## 未实现但可能有用
 
-按我自己的使用经验排序（V1.1 已把原第 1、3 项做掉，V1.2 已做批量导出与 BOM）：
+按我自己的使用经验排序（V1.1 已把原第 1、3 项做掉，V1.2 已做批量导出与 BOM，V1.3 已做原生 3D 建模）：
 
 1. **批量图元删除**——目前只能发 `_.ERASE` 命令
 2. **视口与布局**——模型空间之外的图纸空间操作
 3. **引线标注 / 表面粗糙度 / 焊接符号**
-4. **原生 3D 建模工具**（拉伸、旋转、扫掠、布尔）——见 [ROADMAP](ROADMAP.md) V1.3
+4. **放样 / 曲面造型 / 三视图反推复杂拓扑**——见 [ROADMAP](ROADMAP.md) V2.0
 5. **国产 CAD 双接口兼容**（中望/浩辰）——见 [ROADMAP](ROADMAP.md) V1.4
 
 欢迎 PR。

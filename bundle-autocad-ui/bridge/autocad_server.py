@@ -82,7 +82,7 @@ def _fail(exc: Exception, action: str) -> dict[str, Any]:
 mcp = MCPServer(
     name="autocad",
     title="AutoCAD 2024 Bridge",
-    description="通过原生 COM 操控本机 AutoCAD 2024：绘图图元、机械标准图层自动化、国标尺寸标注体系、块与属性块、文字/MText/形位公差、中心线/镜像/偏移/阵列/修剪、外部参照、自动 BOM 明细表、批量 DXF/DWG/PDF 导出，命令发送、读取图元、保存 DWG。",
+    description="通过原生 COM 操控本机 AutoCAD 2024：绘图图元、机械标准图层自动化、国标尺寸标注体系、块与属性块、文字/MText/形位公差、中心线/镜像/偏移/阵列/修剪、外部参照、自动 BOM 明细表、批量 DXF/DWG/PDF 导出、3D 实体建模与 2D→3D 推理、3D 视图切换，命令发送、读取图元、保存 DWG。",
     instructions=(
         "这是连接本机 AutoCAD 2024 的桥。首次调用任何绘图工具时会自动连接（或启动）AutoCAD。\n"
         "约定：\n"
@@ -95,6 +95,12 @@ mcp = MCPServer(
         "- 机械辅助：cad_add_centerlines 生成中心线、cad_mirror_entities/cad_array_rectangular/\n"
         "  cad_array_polar/cad_offset_entity 补全对称图形、cad_trim_at_points 批量修剪。\n"
         "- 外部参照：cad_attach_xref/cad_list_xrefs/cad_xref_action/cad_repair_xref_paths。\n"
+        "- 3D 建模：cad_add_3d_primitive 建原语（center 是几何中心）、cad_extrude_profile/\n"
+        "  cad_revolve_profile/cad_sweep_profile 由草图成实体、cad_boolean_solids 布尔（并/交/差）、\n"
+        "  cad_fillet_edges/cad_chamfer_edges 倒角圆角、cad_solid_info 读包围盒。\n"
+        "- 2D→3D 一句话：cad_dimensions_to_3d（长宽高→box）、cad_profile_to_3d（闭合轮廓+厚度）。\n"
+        "  两者都会自动切等轴测并着色；cad_set_3d_view 可切 iso/front/top/right 等视图。\n"
+        "- 3D 实体参数的角度都用度（COM 内部是弧度）；Boolean 交集为空时双方会被删除。\n"
         "- AutoCAD 同一时刻只能执行一条命令，遇忙会自动重试；仍失败请让用户在 CAD 里按 ESC 关闭弹窗，\n"
         "  或调用 cad_reconnect 重建 COM 连接。\n"
         "- send_command 是异步发送，返回 sent=true 只代表已发出，不代表已执行完。\n"
@@ -612,6 +618,122 @@ def cad_batch_convert(paths: list[str], out_dir: str, formats: list[str] | None 
         return _ensure_connected().batch_convert(paths, out_dir, formats, unify, close_after)
     except Exception as exc:  # noqa: BLE001
         return _fail(exc, "cad_batch_convert")
+
+
+# ---------------------------------------------------------------------------
+# V1.3 3D 实体建模 / 2D→3D 推理 / 3D 视图
+# ---------------------------------------------------------------------------
+
+@mcp.tool(name="cad_add_3d_primitive", description="建 3D 原语：box/cylinder/sphere/cone/torus/wedge。center 是几何中心（沿 Z 对称，不是底心）。params 传尺寸，如 box 用 {'length':10,'width':20,'height':30}，cylinder 用 {'radius':15,'height':50}。")
+def cad_add_3d_primitive(kind: str, center: list[float] | None = None, params: dict[str, Any] | None = None, layer: str = "", doc_name: str = "") -> dict[str, Any]:
+    try:
+        return _ensure_connected().add_3d_primitive(kind, center or [0.0, 0.0, 0.0], params, layer or None, doc_name or None)
+    except Exception as exc:  # noqa: BLE001
+        return _fail(exc, "cad_add_3d_primitive")
+
+
+@mcp.tool(name="cad_extrude_profile", description="闭合 2D 轮廓（points=[[x,y],...]）→ 面域 → 拉伸实体。height 厚度，taper_deg 拔模角（度）。")
+def cad_extrude_profile(points: list[list[float]], height: float = 10.0, taper_deg: float = 0.0, layer: str = "", doc_name: str = "") -> dict[str, Any]:
+    try:
+        return _ensure_connected().extrude_profile(points, height, taper_deg, layer or None, doc_name or None)
+    except Exception as exc:  # noqa: BLE001
+        return _fail(exc, "cad_extrude_profile")
+
+
+@mcp.tool(name="cad_revolve_profile", description="闭合 2D 轮廓绕轴旋转成实体。axis_point 轴上一点，axis_dir 轴方向向量，angle_deg 旋转角（度）。")
+def cad_revolve_profile(points: list[list[float]], axis_point: list[float] | None = None, axis_dir: list[float] | None = None, angle_deg: float = 360.0, layer: str = "", doc_name: str = "") -> dict[str, Any]:
+    try:
+        return _ensure_connected().revolve_profile(points, axis_point or [0.0, 0.0, 0.0], axis_dir or [0.0, 1.0, 0.0], angle_deg, layer or None, doc_name or None)
+    except Exception as exc:  # noqa: BLE001
+        return _fail(exc, "cad_revolve_profile")
+
+
+@mcp.tool(name="cad_sweep_profile", description="闭合 2D 轮廓沿直线路径扫掠成实体。path_start/path_end 是路径起终点 [x,y,z]。")
+def cad_sweep_profile(points: list[list[float]], path_start: list[float] | None = None, path_end: list[float] | None = None, layer: str = "", doc_name: str = "") -> dict[str, Any]:
+    try:
+        return _ensure_connected().sweep_profile(points, path_start or [0.0, 0.0, 0.0], path_end or [0.0, 0.0, 80.0], layer or None, doc_name or None)
+    except Exception as exc:  # noqa: BLE001
+        return _fail(exc, "cad_sweep_profile")
+
+
+@mcp.tool(name="cad_boolean_solids", description="两个实体布尔运算：union 并集 / intersect 交集 / subtract 差集。handle1/handle2 由建模工具返回，结果留在 handle1。注意交集为空时双方都会被删。")
+def cad_boolean_solids(handle1: str, handle2: str, operation: str = "union", doc_name: str = "") -> dict[str, Any]:
+    try:
+        return _ensure_connected().boolean_solids(handle1, handle2, operation, doc_name or None)
+    except Exception as exc:  # noqa: BLE001
+        return _fail(exc, "cad_boolean_solids")
+
+
+@mcp.tool(name="cad_rotate_3d", description="实体绕 3D 轴旋转。axis_point1/axis_point2 定义旋转轴，angle_deg 旋转角（度，COM 内部是弧度）。")
+def cad_rotate_3d(handle: str, axis_point1: list[float] | None = None, axis_point2: list[float] | None = None, angle_deg: float = 90.0, doc_name: str = "") -> dict[str, Any]:
+    try:
+        return _ensure_connected().rotate_3d(handle, axis_point1 or [0.0, 0.0, 0.0], axis_point2 or [1.0, 0.0, 0.0], angle_deg, doc_name or None)
+    except Exception as exc:  # noqa: BLE001
+        return _fail(exc, "cad_rotate_3d")
+
+
+@mcp.tool(name="cad_slice_solid", description="用三点定义的平面把实体切成两半，返回新实体句柄。negative 控制保留哪一侧。")
+def cad_slice_solid(handle: str, p1: list[float], p2: list[float], p3: list[float], negative: bool = False, doc_name: str = "") -> dict[str, Any]:
+    try:
+        return _ensure_connected().slice_solid(handle, p1, p2, p3, negative, doc_name or None)
+    except Exception as exc:  # noqa: BLE001
+        return _fail(exc, "cad_slice_solid")
+
+
+@mcp.tool(name="cad_section_solid", description="用三点定义的平面取实体截面，返回面域（AcDbRegion）。")
+def cad_section_solid(handle: str, p1: list[float], p2: list[float], p3: list[float], doc_name: str = "") -> dict[str, Any]:
+    try:
+        return _ensure_connected().section_solid(handle, p1, p2, p3, doc_name or None)
+    except Exception as exc:  # noqa: BLE001
+        return _fail(exc, "cad_section_solid")
+
+
+@mcp.tool(name="cad_fillet_edges", description="实体圆角（走 _.FILLETEDGE 命令，COM 无原生方法）。fire-and-forget：命令异步执行、无法读回验证，请在 CAD 里目视确认。")
+def cad_fillet_edges(radius: float = 3.0, doc_name: str = "") -> dict[str, Any]:
+    try:
+        return _ensure_connected().fillet_edges(radius, doc_name or None)
+    except Exception as exc:  # noqa: BLE001
+        return _fail(exc, "cad_fillet_edges")
+
+
+@mcp.tool(name="cad_chamfer_edges", description="实体倒角（走 _.CHAMFEREDGE 命令，COM 无原生方法）。fire-and-forget，请在 CAD 里目视确认。")
+def cad_chamfer_edges(dist1: float = 3.0, dist2: float = 3.0, doc_name: str = "") -> dict[str, Any]:
+    try:
+        return _ensure_connected().chamfer_edges(dist1, dist2, doc_name or None)
+    except Exception as exc:  # noqa: BLE001
+        return _fail(exc, "cad_chamfer_edges")
+
+
+@mcp.tool(name="cad_solid_info", description="读实体包围盒/图层/存活状态。MassProperties 不可用，用 bbox 推断体积。")
+def cad_solid_info(handle: str, doc_name: str = "") -> dict[str, Any]:
+    try:
+        return _ensure_connected().solid_info(handle, doc_name or None)
+    except Exception as exc:  # noqa: BLE001
+        return _fail(exc, "cad_solid_info")
+
+
+@mcp.tool(name="cad_set_3d_view", description="切 3D 视图：iso/front/back/top/bottom/right/left。方向用纯 COM 并赋值回 ActiveViewport，用 VIEWDIR 验证；shade 可传 Conceptual/Realistic 等视觉样式（异步）。")
+def cad_set_3d_view(view: str = "iso", shade: str = "", doc_name: str = "") -> dict[str, Any]:
+    try:
+        return _ensure_connected().set_3d_view(view, shade, doc_name or None)
+    except Exception as exc:  # noqa: BLE001
+        return _fail(exc, "cad_set_3d_view")
+
+
+@mcp.tool(name="cad_dimensions_to_3d", description="「一句话」：输入零件长宽高 → 生成 box 实体 + 自动等轴测视图 + 着色。center 自动设为几何中心使实体占据 [0,L]×[0,W]×[0,H]。")
+def cad_dimensions_to_3d(length: float, width: float, height: float, shade: str = "Conceptual", layer: str = "", doc_name: str = "") -> dict[str, Any]:
+    try:
+        return _ensure_connected().dimensions_to_3d(length, width, height, shade, layer or None, doc_name or None)
+    except Exception as exc:  # noqa: BLE001
+        return _fail(exc, "cad_dimensions_to_3d")
+
+
+@mcp.tool(name="cad_profile_to_3d", description="「一句话」：闭合 2D 草图（points=[[x,y],...]）+ 厚度 → 拉伸实体 + 自动等轴测视图 + 着色。")
+def cad_profile_to_3d(points: list[list[float]], thickness: float = 10.0, shade: str = "Conceptual", layer: str = "", doc_name: str = "") -> dict[str, Any]:
+    try:
+        return _ensure_connected().profile_to_3d(points, thickness, shade, layer or None, doc_name or None)
+    except Exception as exc:  # noqa: BLE001
+        return _fail(exc, "cad_profile_to_3d")
 
 
 # ---------------------------------------------------------------------------

@@ -1,9 +1,10 @@
 # DSH AutoCAD Bridge
 
-把本机 **AutoCAD 2024** 变成 DeepSeek Harness Agent 的一双手：查状态、画图元、管图层、**国标尺寸标注**、块与属性块、MText/形位公差、机械辅助、外部参照、自动 BOM、**批量 DXF/DWG/PDF 交付**，全部通过 MCP 工具调用完成。附带一个可视化的**控制面板**，负责托管后台桥进程的启停、参数、状态灯与实时日志。
+把本机 **AutoCAD 2024** 变成 DeepSeek Harness Agent 的一双手：查状态、画图元、管图层、**国标尺寸标注**、块与属性块、MText/形位公差、机械辅助、外部参照、自动 BOM、**批量 DXF/DWG/PDF 交付**、**3D 实体建模与 2D→3D 推理**，全部通过 MCP 工具调用完成。附带一个可视化的**控制面板**，负责托管后台桥进程的启停、参数、状态灯与实时日志。
 
-**当前版本 1.2.0**（V1.2 非标自动化专用工具集）：56 个工具，一句话即可
-「批量整理整套设备图纸 + 自动出 BOM + 自动转 PDF 交付」；V1.1 的
+**当前版本 1.3.0**（V1.3 2D 转 3D / 参数化实体建模）：70 个工具，一句话即可
+「输入零件尺寸 → 自动 3D 模型 + 等轴测视图」；V1.2 的
+「批量整理整套设备图纸 + 自动出 BOM + 自动转 PDF 交付」、V1.1 的
 「建好机械制图环境 + 画零件 + 自动标注 + 自动分层」同样一句话可达。
 迭代计划见 [docs/ROADMAP.md](docs/ROADMAP.md)，改动记录见 [CHANGELOG.md](CHANGELOG.md)。
 
@@ -64,7 +65,7 @@ AutoCAD 本身是一个桌面 GUI 程序，没有对外的 HTTP API。想在 Age
 - **依赖自举**：一键在你自己的数据目录建虚拟环境、装 pywin32/mcp/python-dotenv
 - **环境探测**：自动找出 Python 与桥目录，自动检测本机实际注册了哪些 AutoCAD ProgID
 
-### 56 个 Agent 工具
+### 70 个 Agent 工具
 
 #### 基础（V1.0，18 个，全部保留）
 
@@ -149,6 +150,40 @@ cad_unify_styles(style="DSH-CN")  → 批量统一字体/图层
 `cad_batch_convert` 内部给每文档单独一次 STA 调用、全局唯一
 SelectionSet 名、以及加宽的 BUSY 重试窗口（连续导出后 CAD 后台收尾会忙
 2~5 秒），实测 3 张图纸连续导出 3/3 通过。
+
+#### V1.3 3D 闭环（14 个）
+
+| 分类 | 工具 | 作用 |
+|---|---|---|
+| 3D 原语 | `cad_add_3d_primitive` | 7 种原语：box/cylinder/sphere/cone/torus/wedge |
+| 3D 建模 | `cad_extrude_profile` | 闭合轮廓 → 面域 → 拉伸实体 |
+| 3D 建模 | `cad_revolve_profile` | 闭合轮廓绕轴旋转成实体 |
+| 3D 建模 | `cad_sweep_profile` | 闭合轮廓沿直线路径扫掠 |
+| 3D 建模 | `cad_boolean_solids` | 布尔并集 / 交集 / 差集 |
+| 3D 建模 | `cad_rotate_3d` | 实体绕 3D 轴旋转 |
+| 3D 建模 | `cad_slice_solid` | 三点平面剖切实体 |
+| 3D 建模 | `cad_section_solid` | 取实体截面（面域） |
+| 3D 建模 | `cad_solid_info` | 读实体包围盒 / 图层 / 存活状态 |
+| 3D 建模 | `cad_fillet_edges` / `cad_chamfer_edges` | 圆角 / 倒角（走命令，异步） |
+| 视图 | `cad_set_3d_view` | iso/front/back/top/bottom/right/left + 着色 |
+| 2D→3D | `cad_dimensions_to_3d` | **长宽高 → 3D 实体 + 等轴测 + 着色** |
+| 2D→3D | `cad_profile_to_3d` | **闭合草图 + 厚度 → 实体 + 等轴测 + 着色** |
+
+#### 一句话从尺寸到 3D 模型
+
+```
+cad_dimensions_to_3d(length=44, width=28, height=40)
+    → box 实体占据 [0,44]×[0,28]×[0,40] + 自动等轴测 + Conceptual 着色
+cad_profile_to_3d(points=[[0,0],[60,0],[60,40],[0,40]], thickness=12)
+    → 拉伸实体 + 自动等轴测 + 着色
+cad_set_3d_view(view="front", shade="Realistic")  → 切前视图
+```
+
+实测要点：原语的 `center` 是**几何中心**（沿 Z 对称），布尔 `0=并/1=交/2=差`
+（与文档相反），角度参数一律用**度**（COM 内部弧度）；`cad_fillet_edges` /
+`cad_chamfer_edges` 走 `_.FILLETEDGE` / `_.CHAMFEREDGE` 命令，是
+fire-and-forget，需在 CAD 里目视确认。视图方向用纯 COM 改
+`ActiveViewport.Direction` 并赋值回，再用 `VIEWDIR` 验证，不发裸 `VPOINT`。
 
 #### 一句话画零件图
 

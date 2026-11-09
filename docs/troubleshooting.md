@@ -86,6 +86,16 @@ V1.1 起可以先调 `cad_status` 看 `queue` 字段：`busy_seconds` 是 COM �
 - 或等几秒再重试，别把单文档导出工具连着猛调；
 - 若刚跑完一轮测试，最干净的办法是关掉 CAD 与桥重来（同时复验冷启动唤醒）。
 
+**V1.3 3D 建模场景**：报
+`(-2145386414, '对象已打开进行通知')` 是因为「新建实体」和「发
+`_.VSCURRENT` 视图命令」挤进了同一次 COM 调用——新建对象还开着通知时
+CAD 不派发命令。`cad_dimensions_to_3d` / `cad_profile_to_3d` /
+`cad_set_3d_view` 已把建模、改视口、发命令拆成各自独立的 `_call`，正常
+调用不会遇到；若你自己写脚本把这几步塞进一次调用，拆开即可。另外
+`cad_fillet_edges` / `cad_chamfer_edges` 是 fire-and-forget 命令，若发现
+圆角没生效，先在 CAD 里目视确认命令有没有跑完（必要时按 ESC 结束挂起
+命令），**不要发裸 `VPOINT`**（实测会让 AutoCAD 停在交互提示、COM 全被拒）。
+
 ### 第四步：`尚未调用 CoInitialize`
 
 **这个错不应该再出现。** 如果出现了，说明桥的版本落后——当前实现用单 STA 线程 + 命令队列，所有 COM 调用都在同一个已初始化的线程上。检查 `bridge/cad_com.py` 里有没有 `_ComWorker` 类。

@@ -10,6 +10,53 @@ full backward compatibility with tools shipped in earlier versions.
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-11-09
+
+V1.3 「2D 转 3D、参数化实体建模」。工具数从 56 增至 **70**（新增 14 个
+`mcp__autocad__*` 工具），全部通过 live AutoCAD 2024 端到端实测
+（`bridge/live_v13_test.py` 25/25 全绿）。向下兼容：1.0.0/1.1.0/1.2.0 里所有
+工具名、参数与返回结构保持不变。交付标准达成：AI 一句话「输入零件尺寸 →
+自动 3D 模型 + 等轴测视图」。
+
+### Added — V1.3 3D 闭环
+
+- **3D 原生 COM 支持（V1.3-1）** 11 工具：
+  - `cad_add_3d_primitive` — 7 种原语（box/cylinder/sphere/cone/torus/wedge）。
+    实测 `AddBox`/`AddCylinder` 的 center 是**几何中心**（沿 Z 对称），不是底心。
+  - `cad_extrude_profile` / `cad_revolve_profile` / `cad_sweep_profile` —
+    闭合 2D 轮廓 → 面域 → 拉伸/旋转/扫掠实体；角度用度（COM 内部弧度）。
+    实测面域会被消耗，每次建模都由 `_closed_region` 建全新面域。
+  - `cad_boolean_solids` — 布尔并/交/差。实测 operation 编码**与文档相反**：
+    `0=并 / 1=交 / 2=差`；交集为空时双方一起被删，用 bbox 判断存活。
+  - `cad_rotate_3d` / `cad_slice_solid` / `cad_section_solid` / `cad_solid_info` —
+    旋转、剖切、截面、读包围盒（MassProperties 不可用，用 bbox 代替）。
+  - `cad_fillet_edges` / `cad_chamfer_edges` — 圆角/倒角。实测 COM 全库**无**
+    Fillet/Chamfer/Sweep/Loft 实体方法，走 `_.FILLETEDGE`/`_.CHAMFEREDGE` 命令，
+    fire-and-forget（异步、无法读回验证，需在 CAD 里目视确认）。
+- **2D→3D 自动推理（V1.3-2）** 2 工具：
+  - `cad_dimensions_to_3d` — 长宽高 → box 实体（占据 [0,L]×[0,W]×[0,H]）
+    + 自动等轴测 + 着色。
+  - `cad_profile_to_3d` — 闭合草图 + 厚度 → 拉伸实体 + 自动等轴测 + 着色。
+- **3D 视图自动切换（V1.3-3）** 1 工具：
+  - `cad_set_3d_view` — iso/front/back/top/bottom/right/left。方向走纯 COM
+    `ActiveViewport.Direction` 且**必须赋值回 `doc.ActiveViewport`**（只改副本
+    不生效），用 `GetVariable("VIEWDIR")` 验证；VSCURRENT 视觉样式异步发送。
+
+### Fixed — 建模与视图的 COM 隔离
+
+- 把「建模」「改视口方向」「发 VSCURRENT 命令」拆成各自独立的 `_call`：
+  三者挤进同一 COM 调用会触发
+  `(-2145386414, '对象已打开进行通知')`（新建对象还开着通知时不能派发命令）。
+  `_apply_view` 只做纯 COM 方向切换，`_view_and_shade` 把着色另起一次 `_call`。
+- `probe_v13d.py` 曾因发裸 `-VPOINT` 命令让 AutoCAD 停在交互提示、COM 全被拒；
+  **生产代码绝不发裸 VPOINT**，视图方向一律走 ActiveViewport 赋值回。
+
+### Changed
+
+- `MCPServer` 的 description 增加 3D 建模/2D→3D/视图切换；instructions 增加
+  3D 建模、一句话推理、视图三条约定。
+- `bundle-autocad-ui/package.json` 版本升至 1.3.0。
+
 ## [1.2.0] - 2026-11-09
 
 V1.2 「非标自动化专用工具集」。工具数从 39 增至 **56**，全部通过 live
