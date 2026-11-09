@@ -82,7 +82,7 @@ def _fail(exc: Exception, action: str) -> dict[str, Any]:
 mcp = MCPServer(
     name="autocad",
     title="AutoCAD 2024 Bridge",
-    description="通过原生 COM 操控本机 AutoCAD 2024：绘图图元、机械标准图层自动化、国标尺寸标注体系、块与属性块、文字/MText/形位公差、命令发送、读取图元、保存 DWG。",
+    description="通过原生 COM 操控本机 AutoCAD 2024：绘图图元、机械标准图层自动化、国标尺寸标注体系、块与属性块、文字/MText/形位公差、中心线/镜像/偏移/阵列/修剪、外部参照、自动 BOM 明细表、批量 DXF/DWG/PDF 导出，命令发送、读取图元、保存 DWG。",
     instructions=(
         "这是连接本机 AutoCAD 2024 的桥。首次调用任何绘图工具时会自动连接（或启动）AutoCAD。\n"
         "约定：\n"
@@ -90,6 +90,11 @@ mcp = MCPServer(
         "- 图层不存在会自动创建；layer 省略时用 CAD 当前图层。调用 cad_setup_mechanical_environment\n"
         "  后，省略 layer 的图元会按大类自动归属到 轮廓/中心线/虚线/标注/文字/剖面线 标准图层。\n"
         "- 画正规机械零件图推荐顺序：cad_setup_mechanical_environment → 画轮廓 → 加标注 → cad_zoom_extents。\n"
+        "- 非标自动化一句话交付：cad_batch_convert 批量整理整套图纸出 DXF/DWG/PDF，\n"
+        "  cad_generate_bom 自动统计块出明细表并对齐图纸右下角，cad_unify_styles 统一字体/图层。\n"
+        "- 机械辅助：cad_add_centerlines 生成中心线、cad_mirror_entities/cad_array_rectangular/\n"
+        "  cad_array_polar/cad_offset_entity 补全对称图形、cad_trim_at_points 批量修剪。\n"
+        "- 外部参照：cad_attach_xref/cad_list_xrefs/cad_xref_action/cad_repair_xref_paths。\n"
         "- AutoCAD 同一时刻只能执行一条命令，遇忙会自动重试；仍失败请让用户在 CAD 里按 ESC 关闭弹窗，\n"
         "  或调用 cad_reconnect 重建 COM 连接。\n"
         "- send_command 是异步发送，返回 sent=true 只代表已发出，不代表已执行完。\n"
@@ -467,6 +472,146 @@ def cad_add_tolerance(text: str, position: list[float], direction: list[float] |
         return _ensure_connected().add_tolerance(text, position, direction or [1.0, 0.0, 0.0], layer or None, doc_name or None)
     except Exception as exc:  # noqa: BLE001
         return _fail(exc, "cad_add_tolerance")
+
+
+# ---------------------------------------------------------------------------
+# V1.2 非标自动化：机械辅助 / 外部参照 / BOM / 批量引擎
+# ---------------------------------------------------------------------------
+
+@mcp.tool(name="cad_add_centerlines", description="按矩形两角自动生成 H/V 两条居中中心线（超出轮廓 extension），落在中心线图层。")
+def cad_add_centerlines(corner1: list[float], corner2: list[float], extension: float = 5.0, layer: str = "", doc_name: str = "") -> dict[str, Any]:
+    try:
+        return _ensure_connected().add_centerlines(corner1, corner2, extension, layer or None, doc_name or None)
+    except Exception as exc:  # noqa: BLE001
+        return _fail(exc, "cad_add_centerlines")
+
+
+@mcp.tool(name="cad_mirror_entities", description="按镜像轴补全图形；handles 是要镜像的图元句柄列表，keep_source=False 只留镜像结果。")
+def cad_mirror_entities(handles: list[str], axis_point1: list[float], axis_point2: list[float], keep_source: bool = True, layer: str = "", doc_name: str = "") -> dict[str, Any]:
+    try:
+        return _ensure_connected().mirror_entities(handles, axis_point1, axis_point2, keep_source, layer or None, doc_name or None)
+    except Exception as exc:  # noqa: BLE001
+        return _fail(exc, "cad_mirror_entities")
+
+
+@mcp.tool(name="cad_offset_entity", description="等距偏移一个图元（distance 可为负表示反向）。")
+def cad_offset_entity(handle: str, distance: float, layer: str = "", doc_name: str = "") -> dict[str, Any]:
+    try:
+        return _ensure_connected().offset_entity(handle, distance, layer or None, doc_name or None)
+    except Exception as exc:  # noqa: BLE001
+        return _fail(exc, "cad_offset_entity")
+
+
+@mcp.tool(name="cad_array_rectangular", description="矩形阵列；rows/cols 行列数，dist_rows/dist_cols 间距，返回新生成图元句柄（不含原图元）。")
+def cad_array_rectangular(handle: str, rows: int, cols: int, dist_rows: float, dist_cols: float, levels: int = 1, dist_levels: float = 0.0, layer: str = "", doc_name: str = "") -> dict[str, Any]:
+    try:
+        return _ensure_connected().array_rectangular(handle, rows, cols, dist_rows, dist_cols, levels, dist_levels, layer or None, doc_name or None)
+    except Exception as exc:  # noqa: BLE001
+        return _fail(exc, "cad_array_rectangular")
+
+
+@mcp.tool(name="cad_array_polar", description="环形阵列；count 个数，angle_deg 用度（默认 360 整圈），center 是旋转中心。")
+def cad_array_polar(handle: str, count: int, angle_deg: float = 360.0, center: list[float] | None = None, layer: str = "", doc_name: str = "") -> dict[str, Any]:
+    try:
+        return _ensure_connected().array_polar(handle, count, angle_deg, center or [0.0, 0.0], layer or None, doc_name or None)
+    except Exception as exc:  # noqa: BLE001
+        return _fail(exc, "cad_array_polar")
+
+
+@mcp.tool(name="cad_trim_at_points", description="批量修剪：走 _.TRIM 命令，接受全部剪切边，依次点选要剪掉的部分。points 是 [[x,y],...] 拾取点。")
+def cad_trim_at_points(points: list[list[float]], doc_name: str = "") -> dict[str, Any]:
+    try:
+        return _ensure_connected().trim_at_points(points, doc_name or None)
+    except Exception as exc:  # noqa: BLE001
+        return _fail(exc, "cad_trim_at_points")
+
+
+@mcp.tool(name="cad_list_xrefs", description="列出当前图纸里的外部参照块名与路径。")
+def cad_list_xrefs(doc_name: str = "") -> dict[str, Any]:
+    try:
+        return _ensure_connected().list_xrefs(doc_name or None)
+    except Exception as exc:  # noqa: BLE001
+        return _fail(exc, "cad_list_xrefs")
+
+
+@mcp.tool(name="cad_attach_xref", description="附着一个 DWG 外部参照。position 插入点，rotation_deg 用度，overlay 是否覆盖型。")
+def cad_attach_xref(path: str, name: str, position: list[float] | None = None, xscale: float = 1.0, yscale: float = 1.0, zscale: float = 1.0, rotation_deg: float = 0.0, overlay: bool = False, doc_name: str = "") -> dict[str, Any]:
+    try:
+        return _ensure_connected().attach_xref(path, name, position or [0.0, 0.0], xscale, yscale, zscale, rotation_deg, overlay, doc_name or None)
+    except Exception as exc:  # noqa: BLE001
+        return _fail(exc, "cad_attach_xref")
+
+
+@mcp.tool(name="cad_xref_action", description="对外部参照执行 bind/unload/reload/detach/repair；repair 需给 new_path 新路径。")
+def cad_xref_action(name: str, action: str = "reload", new_path: str = "", doc_name: str = "") -> dict[str, Any]:
+    try:
+        return _ensure_connected().xref_action(name, action, new_path or None, doc_name or None)
+    except Exception as exc:  # noqa: BLE001
+        return _fail(exc, "cad_xref_action")
+
+
+@mcp.tool(name="cad_repair_xref_paths", description="批量路径修复：把以 old_prefix 开头的参照路径替换成 new_prefix。")
+def cad_repair_xref_paths(old_prefix: str, new_prefix: str, doc_name: str = "") -> dict[str, Any]:
+    try:
+        return _ensure_connected().repair_xref_paths(old_prefix, new_prefix, doc_name or None)
+    except Exception as exc:  # noqa: BLE001
+        return _fail(exc, "cad_repair_xref_paths")
+
+
+@mcp.tool(name="cad_count_blocks", description="统计模型空间块参照数量并取属性样例，作为 BOM 数据源，不修改图纸。")
+def cad_count_blocks(doc_name: str = "") -> dict[str, Any]:
+    try:
+        return _ensure_connected().count_blocks(doc_name or None)
+    except Exception as exc:  # noqa: BLE001
+        return _fail(exc, "cad_count_blocks")
+
+
+@mcp.tool(name="cad_generate_bom", description="自动统计块 → 生成明细表表格；不给 position 时对齐到图纸右下角。columns 可自定义表头。")
+def cad_generate_bom(position: list[float] | None = None, columns: list[str] | None = None, row_height: float = 8.0, col_width: float = 30.0, margin: float = 10.0, layer: str = "", doc_name: str = "") -> dict[str, Any]:
+    try:
+        return _ensure_connected().generate_bom(position, columns, row_height, col_width, margin, layer or None, doc_name or None)
+    except Exception as exc:  # noqa: BLE001
+        return _fail(exc, "cad_generate_bom")
+
+
+@mcp.tool(name="cad_unify_styles", description="批量统一字体样式/图层（样式不存在自动建中文大字体 DSH-CN）。style/layer 给空串表示不改。")
+def cad_unify_styles(style: str = "", layer: str = "", doc_name: str = "") -> dict[str, Any]:
+    try:
+        return _ensure_connected().unify_styles(style, layer, doc_name or None)
+    except Exception as exc:  # noqa: BLE001
+        return _fail(exc, "cad_unify_styles")
+
+
+@mcp.tool(name="cad_export_dxf", description="当前图纸导出 DXF（全选图元）。path 给不带或带 .dxf 扩展名均可，内部自动处理。")
+def cad_export_dxf(path: str, doc_name: str = "") -> dict[str, Any]:
+    try:
+        return _ensure_connected().export_dxf(path, doc_name or None)
+    except Exception as exc:  # noqa: BLE001
+        return _fail(exc, "cad_export_dxf")
+
+
+@mcp.tool(name="cad_export_dwg", description="当前图纸用 Wblock 导出 DWG（全选图元）。")
+def cad_export_dwg(path: str, doc_name: str = "") -> dict[str, Any]:
+    try:
+        return _ensure_connected().export_dwg(path, doc_name or None)
+    except Exception as exc:  # noqa: BLE001
+        return _fail(exc, "cad_export_dwg")
+
+
+@mcp.tool(name="cad_export_pdf", description="当前图纸高清打印成 PDF（DWG To PDF.pc3 + 按范围）。")
+def cad_export_pdf(path: str, doc_name: str = "") -> dict[str, Any]:
+    try:
+        return _ensure_connected().export_pdf(path, doc_name or None)
+    except Exception as exc:  # noqa: BLE001
+        return _fail(exc, "cad_export_pdf")
+
+
+@mcp.tool(name="cad_batch_convert", description="「一句话交付」：批量打开整套图纸，每种格式导出，可选统一字体/图层，然后关闭。formats 默认 [dxf,dwg,pdf]。")
+def cad_batch_convert(paths: list[str], out_dir: str, formats: list[str] | None = None, unify: bool = False, close_after: bool = True) -> dict[str, Any]:
+    try:
+        return _ensure_connected().batch_convert(paths, out_dir, formats, unify, close_after)
+    except Exception as exc:  # noqa: BLE001
+        return _fail(exc, "cad_batch_convert")
 
 
 # ---------------------------------------------------------------------------

@@ -1,10 +1,11 @@
 # DSH AutoCAD Bridge
 
-把本机 **AutoCAD 2024** 变成 DeepSeek Harness Agent 的一双手：查状态、画图元、管图层、**国标尺寸标注**、块与属性块、MText/形位公差、跑原生命令、建 3D 实体，全部通过 MCP 工具调用完成。附带一个可视化的**控制面板**，负责托管后台桥进程的启停、参数、状态灯与实时日志。
+把本机 **AutoCAD 2024** 变成 DeepSeek Harness Agent 的一双手：查状态、画图元、管图层、**国标尺寸标注**、块与属性块、MText/形位公差、机械辅助、外部参照、自动 BOM、**批量 DXF/DWG/PDF 交付**，全部通过 MCP 工具调用完成。附带一个可视化的**控制面板**，负责托管后台桥进程的启停、参数、状态灯与实时日志。
 
-**当前版本 1.1.0**（V1.1 工业基础能力补全）：39 个工具，一句话即可
-「建好机械制图环境 + 画零件 + 自动标注 + 自动分层」。迭代计划见
-[docs/ROADMAP.md](docs/ROADMAP.md)，改动记录见 [CHANGELOG.md](CHANGELOG.md)。
+**当前版本 1.2.0**（V1.2 非标自动化专用工具集）：56 个工具，一句话即可
+「批量整理整套设备图纸 + 自动出 BOM + 自动转 PDF 交付」；V1.1 的
+「建好机械制图环境 + 画零件 + 自动标注 + 自动分层」同样一句话可达。
+迭代计划见 [docs/ROADMAP.md](docs/ROADMAP.md)，改动记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 > English: [README.en.md](README.en.md)
 
@@ -63,7 +64,7 @@ AutoCAD 本身是一个桌面 GUI 程序，没有对外的 HTTP API。想在 Age
 - **依赖自举**：一键在你自己的数据目录建虚拟环境、装 pywin32/mcp/python-dotenv
 - **环境探测**：自动找出 Python 与桥目录，自动检测本机实际注册了哪些 AutoCAD ProgID
 
-### 39 个 Agent 工具
+### 56 个 Agent 工具
 
 #### 基础（V1.0，18 个，全部保留）
 
@@ -113,6 +114,41 @@ AutoCAD 本身是一个桌面 GUI 程序，没有对外的 HTTP API。想在 Age
 | 块 | `cad_replace_block` | 批量替换块参照 |
 | 文字 | `cad_add_mtext` | 多行文字（含堆叠公差） |
 | 文字 | `cad_add_tolerance` | 形位公差框 |
+
+#### V1.2 非标自动化（17 个）
+
+| 分类 | 工具 | 作用 |
+|---|---|---|
+| 机械辅助 | `cad_add_centerlines` | 按矩形两角自动生成居中中心线 |
+| 机械辅助 | `cad_mirror_entities` | 按镜像轴补全对称图形 |
+| 机械辅助 | `cad_offset_entity` | 等距偏移一个图元 |
+| 机械辅助 | `cad_array_rectangular` | 矩形阵列 |
+| 机械辅助 | `cad_array_polar` | 环形阵列（角度用度） |
+| 机械辅助 | `cad_trim_at_points` | 批量修剪（走原生 `_.TRIM` 命令） |
+| 外部参照 | `cad_list_xrefs` | 列出外部参照与路径 |
+| 外部参照 | `cad_attach_xref` | 附着 DWG 外部参照 |
+| 外部参照 | `cad_xref_action` | 绑定/卸载/重载/拆离/修复单个参照 |
+| 外部参照 | `cad_repair_xref_paths` | 批量修复参照路径前缀 |
+| 明细表 | `cad_count_blocks` | 统计块参照数量 + 属性样例 |
+| 明细表 | `cad_generate_bom` | 自动生成 BOM 明细表（可对齐右下角） |
+| 批量 | `cad_unify_styles` | 统一字体样式 / 图层 |
+| 批量 | `cad_export_dxf` | 当前图纸导出 DXF |
+| 批量 | `cad_export_dwg` | 当前图纸导出 DWG（Wblock） |
+| 批量 | `cad_export_pdf` | 当前图纸高清打印成 PDF |
+| 批量 | `cad_batch_convert` | **一句话批量整理整套图纸并出 BOM / 转 PDF** |
+
+#### 一句话交付整套非标图纸
+
+```
+cad_batch_convert(paths=[...], out_dir=..., formats=["dxf","dwg","pdf"])
+    → 逐张打开 → 统一字体 → 三格式导出 → 关闭
+cad_generate_bom()   → 自动统计块 → 生成明细表并对齐图纸右下角
+cad_unify_styles(style="DSH-CN")  → 批量统一字体/图层
+```
+
+`cad_batch_convert` 内部给每文档单独一次 STA 调用、全局唯一
+SelectionSet 名、以及加宽的 BUSY 重试窗口（连续导出后 CAD 后台收尾会忙
+2~5 秒），实测 3 张图纸连续导出 3/3 通过。
 
 #### 一句话画零件图
 
@@ -239,6 +275,9 @@ AutoCAD 版本与 ProgID：
 - **单实例串行**：所有 COM 调用排队经过一个 STA 线程，并发调用不会崩，但
   也不会更快——AutoCAD 本来就是单线程。
 - **不做视觉校验**：桥只管把东西画出来。画得对不对、好不好看，得另外看图。
+- **批量导出是串行且无事务回滚**：连续导出后 CAD 后台会忙 2~5 秒，
+  `cad_batch_convert` 用加宽重试窗口兜住，但失败仍需手动清理半成品
+  （见 [限制](docs/limitations.md)）。
 - **控制面板的像素级渲染未经自动化验证**：功能逻辑有 headless 测试覆盖，
   但界面外观需要你自己点一下确认（见 [限制](docs/limitations.md)）。
 

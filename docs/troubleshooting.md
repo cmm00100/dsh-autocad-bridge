@@ -79,6 +79,13 @@ V1.1 起可以先调 `cad_status` 看 `queue` 字段：`busy_seconds` 是 COM �
 `TypeError: This COM object can not automate the makepy process`，桥已对此
 做了重试兜底，不必手动干预。
 
+**V1.2 批量导出场景**：连续 DXF/Wblock/PDF 后 CAD 后台收尾会额外忙 2~5 秒，
+默认的 2×0.8s 窗口可能不够，报「AutoCAD 一直处于忙碌状态（批量处理 xxx
+重试 2 次仍失败）」。这不是弹窗，别急着按 ESC：
+- 用 `cad_batch_convert` 一次做完（它内部用 12×0.6s + 180s 的加宽窗口）；
+- 或等几秒再重试，别把单文档导出工具连着猛调；
+- 若刚跑完一轮测试，最干净的办法是关掉 CAD 与桥重来（同时复验冷启动唤醒）。
+
 ### 第四步：`尚未调用 CoInitialize`
 
 **这个错不应该再出现。** 如果出现了，说明桥的版本落后——当前实现用单 STA 线程 + 命令队列，所有 COM 调用都在同一个已初始化的线程上。检查 `bridge/cad_com.py` 里有没有 `_ComWorker` 类。

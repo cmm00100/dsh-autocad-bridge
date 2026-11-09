@@ -323,3 +323,99 @@ TypeError: This COM object can not automate the makepy process - please run make
 | `AddTolerance(text, insertionPoint, direction)` | 返回 `AcDbFcf`；`direction` 是点向量 |
 
 `direction` 之类向量参数同样要 `VARIANT(VT_ARRAY|VT_R8)`。
+
+---
+
+## V1.2 补充：机械辅助、外部参照、批量导出的实测语义
+
+以下都是 V1.2 开发期用 live AutoCAD 2024 逐条验证过的（`probe_v12*.py`
+六轮 probe + `live_v12_test.py` 冷启动 29/29），按直觉写会静默出错或报
+`参数无效` / `当前状态下，该特性不可用`。
+
+### 按句柄操作图元必须 `dynamic.Dispatch`
+
+`doc.HandleToObject(handle)` 或 `ms.Item(i)` 返回的对象会被 gen_py 窄化成
+`IAcadEntity` 基类，直接调 `Mirror` / `Offset` / `Array*` / `GetBoundingBox`
+会 `AttributeError`。生产路径：
+
+```python
+e = dynamic.Dispatch(doc.HandleToObject(handle))
+e.Mirror(P(0, -50), P(0, 50))        # 返回新实体
+e.Offset(10.0)                        # 返回 tuple（可能单元素）
+e.ArrayRectangular(2, 3, 1, 15.0, 40.0, 0.0)   # 返回 tuple
+e.ArrayPolar(6, math.radians(180), P(10, 70))  # 角度是弧度
+e.GetBoundingBox()                    # 返回 (minTuple, maxTuple)
+```
+
+`Array*` 返回的 tuple **只含新对象、不含原对象**（2×3=6 个返回 5 个）。
+
+### 没有 Trim/Extend/Break 实体方法
+
+gen_py 里 `IAcadEntity` 及其实体接口都没有 `Trim` / `Extend` / `Break`。
+批量修剪只能走原生命令，且是**异步**的：
+
+```
+doc.SendCommand("_.TRIM\n\n80,10\n\n")     # 单点：全部作剪切边 + 选点 + 回车结束
+doc.SendCommand("_.TRIM\n\n350,20\n350,25\n\n")  # 多点
+time.sleep(0.6)  # 给 CAD 执行时间
+```
+
+第一个 `\n\n` 是「回车接受全部作为剪切边」，最后的 `\n` 是「回车结束」。
+
+### 外部参照的生命周期方法在 BLOCK 定义上
+
+实测对象归属对比：
+
+| 方法 | `dynamic.Dispatch(doc.Blocks.Item(name))` | `AcDbBlockReference` 实体 |
+|---|---|---|
+| `Bind` / `Unload` / `Reload` / `Detach` | ✓ | ✗ `AttributeError` |
+| `IsXRef` / `Path`（可写） | ✓ | `Path` 有、`IsXRef` 无 |
+| `GetAttributes` | ✗ | ✓ |
+
+`AttachExternalReference(path, name, insPt, xs, ys, zs, rot, overlay)` 挂在
+`doc.ModelSpace` 上，返回的只是块参照实体；`bind/unload/reload/detach/repair`
+必须重新按名字取 `doc.Blocks.Item(name)` 并 `dynamic.Dispatch`。绑定后
+`IsXRef` 变 `False`、`Path` 变空。
+
+### DXF / DWG / PDF 导出的三个坑
+
+- **DXF 用无扩展名路径**：`doc.Export(base, "DXF", ss)` → 产物是 `base+".dxf"`。
+  把 `.dxf` 写进 `FileName` 反而静默失败（size=-1）；`Export(base,"DWG",ss)`
+  报「参数无效」，DWG 不是合法 Export extension。
+- **DWG 走 `Wblock`**：`doc.Wblock(path+".dwg", ss)`；`doc.SaveAs(p, 13)` 也能
+  出 DXF 但会让 CAD 长时间进入忙态，批量流里必须放最后（生产代码不用它）。
+- **PDF 四件套**：`lay = dynamic.Dispatch(doc.ActiveLayout)`；
+  `lay.ConfigName = "DWG To PDF.pc3"`；`doc.SetVariable("BACKGROUNDPLOT", 0)`；
+  `lay.PlotType = 1`；`doc.Plot.PlotToFile(pdf)` —— **不传第二个 config 参数**。
+  本机默认 `ConfigName` 是 `Microsoft Print to PDF`。
+
+### SelectionSet 必须全局唯一名 + 裸对象
+
+`col.Add(name)` 同名残留会让下一次 `Add` 报
+`com_error: (-2147352567, '发生意外。', (0, None, None, None, 0, -2147352571), 1)`。
+生产配方：
+
+```python
+name = f"DSH_BATCH_{next(_SS_COUNTER)}"   # itertools.count(1)，全局唯一
+s = col.Add(name)                         # 裸对象，不要 dynamic.Dispatch
+s.Select(5)                               # acSelectionSetAll = 5
+# ... export ...
+s.Delete()
+```
+
+`dynamic.Dispatch(s)` 会丢掉 `Select`。实测 `Select` 模式：`5`(All)=3 个、
+`3`=3、`4`=1，`0/1/2` 参数错误。
+
+### 批量：已打开的文档不要重复 `Open`
+
+`app.Documents.Open(src)` 对**同一路径已打开**的文档会再建一个文档视图
+（`:5 - 只读` 之类），累积后 COM 状态混乱、`Documents.Count` 虚高。生产先按
+`str(d.FullName).lower()` 找 `existing`，命中就复用且**结束时不关闭**（那属于
+用户），否则才 `Open` + `Close(False)`。
+
+### `_call` 的 BUSY 窗口按场景加宽
+
+默认 `retry_times=2 × 0.8s` 对单条绘图命令够用，但连续 DXF/Wblock/PDF 后
+CAD 后台收尾会忙 2~5 秒。V1.2 给 `_call` 加了可选 `retries / retry_delay_s /
+timeout_s` 覆盖，**仅 `batch_convert`** 用 `12×0.6s + 180s`；不传时行为与
+V1.1 完全一致（向下兼容）。

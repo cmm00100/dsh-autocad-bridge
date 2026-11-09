@@ -17,6 +17,7 @@ cad_com.py — AutoCAD COM 桥接层（DSH x AutoCAD 插件的第一层）
 """
 from __future__ import annotations
 
+import itertools
 import math
 import os
 import queue
@@ -106,6 +107,9 @@ CN_FONT = "gbenor.shx"
 CN_BIGFONT = "gbcbig.shx"
 
 #: 图元大类 → 标准图层（setup_standard_layers 之后启用"自动归属"）
+#: V1.2：批量引擎给 SelectionSet 生成全局唯一名（probe_v12f 三连过的前提）。
+_SS_COUNTER = itertools.count(1)
+
 DEFAULT_LAYER_BY_KIND: dict[str, str] = {
     "outline": "轮廓",
     "center": "中心线",
@@ -547,7 +551,15 @@ class CadBridge:
         except Exception:
             return default
 
-    def _call(self, label: str, fn):
+    def _call(
+        self,
+        label: str,
+        fn,
+        *,
+        retries: int | None = None,
+        retry_delay_s: float | None = None,
+        timeout_s: float | None = None,
+    ):
         """
         所有 COM 操作都必须经过这里。
 
@@ -558,14 +570,21 @@ class CadBridge:
           - 重试耗尽 → 抛 CadBusyError（并提示可能有弹窗）；
           - COM 断开 → 抛 CadDisconnectedError；
           - 其他错误 → 抛 CadError，附上 label 方便定位是哪一步炸的。
+
+        V1.2：retries / retry_delay_s / timeout_s 三个可选覆盖只给批量引擎用。
+        实测（live_v12_test）：连续 DXF/Wblock/PDF 导出后，CAD 后台收尾会忙
+        2~5 秒，默认的 retry_times=2 × 0.8s 窗口不够，导致第 3 张图纸偶发失败。
+        不传时行为与 V1.1 完全一致（向下兼容）。
         """
+        n = int(retries) if retries is not None else self.retry_times
+        delay = float(retry_delay_s) if retry_delay_s is not None else self.retry_delay_ms / 1000.0
 
         def _attempt() -> Any:
             if self._app is None:
                 raise CadDisconnectedError("尚未连接 AutoCAD，请先调用 connect。")
 
             last: Exception | None = None
-            for attempt in range(1, self.retry_times + 1):
+            for attempt in range(1, n + 1):
                 try:
                     self._ensure_com()
                     return fn()
@@ -573,11 +592,11 @@ class CadBridge:
                     hresult = _hresult(exc)
                     if hresult in BUSY_HRESULTS:
                         last = exc
-                        if attempt < self.retry_times:
-                            time.sleep(self.retry_delay_ms / 1000.0)
+                        if attempt < n:
+                            time.sleep(delay)
                             continue
                         raise CadBusyError(
-                            f"AutoCAD 一直处于忙碌状态（{label} 重试 {self.retry_times} 次仍失败）。\n"
+                            f"AutoCAD 一直处于忙碌状态（{label} 重试 {n} 次仍失败）。\n"
                             "可能原因：CAD 正在执行长命令，或弹出了模态对话框（字体缺失/许可/警告）。\n"
                             "建议：切到 CAD 窗口看一眼，按 ESC 关掉弹窗后重试。"
                         ) from exc
@@ -593,7 +612,7 @@ class CadBridge:
                     raise CadError(f"{label} 失败：{exc}") from exc
             raise CadError(f"{label} 失败：{last}")
 
-        return self._on_com(_attempt)
+        return self._on_com(_attempt, timeout_s=timeout_s)
 
     # -- 文档 --------------------------------------------------------------
 
@@ -1696,6 +1715,718 @@ class CadBridge:
         info = self._call("写形位公差", _do)
         return {"ok": True, "type": "tolerance", "text": str(text), "layer": layer,
                 **info, "document": self._last_doc_name}
+
+    # -----------------------------------------------------------------------
+    # V1.2 非标自动化：机械辅助 / 外部参照 / BOM / 批量引擎
+    #
+    # 所有 COM 操作仍走 _call() 的 STA 单线程队列；坐标一律 _pt()/dbl_array()；
+    # 角度对外用「度」，进 COM 前 math.radians()。下列签名全部来自本机
+    # AutoCAD 2024 的 live probe（bridge/probe_v12*.py），不靠猜。
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _fsize(path: str) -> int:
+        try:
+            return os.path.getsize(path)
+        except OSError:
+            return -1
+
+    @staticmethod
+    def _select_all(doc: Any) -> Any:
+        """建一个全局唯一名的 SelectionSet 并全选。
+
+        实测（probe_v12f）：必须用 col.Add() 返回的「裸对象」调 Select(5)；
+        dynamic.Dispatch(ss) 会丢掉 Select。唯一名是连续批量 3 连过的前提。
+        """
+        col = doc.SelectionSets
+        name = f"DSH_BATCH_{next(_SS_COUNTER)}"
+        s = col.Add(name)
+        try:
+            s.Select(5)  # acSelectionSetAll
+        except Exception:
+            dynamic.Dispatch(s).Select(5)
+        return s
+
+    @staticmethod
+    def _drawing_bounds(doc: Any):
+        """遍历图元 GetBoundingBox 求全图范围（比 EXTMIN/EXTMAX 稳，后者需先 Zoom）。"""
+        lo = [float("inf")] * 3
+        hi = [float("-inf")] * 3
+        found = False
+        ms = doc.ModelSpace
+        for i in range(int(ms.Count)):
+            try:
+                e = dynamic.Dispatch(ms.Item(i))
+                mn, mx = e.GetBoundingBox()
+                for k in range(min(3, len(mn), len(mx))):
+                    a, b = float(mn[k]), float(mx[k])
+                    lo[k] = min(lo[k], a, b)
+                    hi[k] = max(hi[k], a, b)
+                found = True
+            except Exception:
+                continue
+        return (lo, hi) if found else None
+
+    @staticmethod
+    def _set_cell(table: Any, row: int, col: int, text: str) -> None:
+        s = str(text)
+        try:
+            table.SetText(int(row), int(col), s)
+        except Exception:
+            table.SetTextString(int(row), int(col), 0, s)
+
+    @staticmethod
+    def _xref_block(doc: Any, name: str) -> Any:
+        for i in range(int(doc.Blocks.Count)):
+            b = doc.Blocks.Item(i)
+            try:
+                if str(b.Name) == str(name):
+                    return dynamic.Dispatch(b)
+            except Exception:
+                continue
+        raise CadError(f"找不到块/外部参照 '{name}'。")
+
+    # -- V1.2-4 机械常用辅助功能 -------------------------------------------
+
+    def add_centerlines(
+        self,
+        corner1: Sequence[float],
+        corner2: Sequence[float],
+        extension: float = 5.0,
+        layer: str | None = None,
+        doc_name: str | None = None,
+    ) -> dict[str, Any]:
+        """按矩形两角自动生成 H/V 两条居中中心线（超出轮廓 extension）。"""
+        layer = self._layer_for(layer, "center")
+        if layer:
+            self.ensure_layer(layer, doc_name=doc_name)
+
+        def _do():
+            doc = self._document(doc_name)
+            ms = doc.ModelSpace
+            x1, y1 = float(corner1[0]), float(corner1[1])
+            x2, y2 = float(corner2[0]), float(corner2[1])
+            minx, maxx = min(x1, x2), max(x1, x2)
+            miny, maxy = min(y1, y2), max(y1, y2)
+            cx, cy = (minx + maxx) / 2.0, (miny + maxy) / 2.0
+            e = float(extension)
+            h = ms.AddLine(_pt(minx - e, cy), _pt(maxx + e, cy))
+            v = ms.AddLine(_pt(cx, miny - e), _pt(cx, maxy + e))
+            for ent in (h, v):
+                if layer:
+                    try:
+                        dynamic.Dispatch(ent).Layer = layer
+                    except Exception:
+                        pass
+            return {"center": [cx, cy],
+                    "handles": [self._safe(lambda o=h: str(o.Handle), default=""),
+                                self._safe(lambda o=v: str(o.Handle), default="")]}
+
+        info = self._call("生成中心线", _do)
+        return {"ok": True, "layer": layer, **info, "document": self._last_doc_name}
+
+    def mirror_entities(
+        self,
+        handles: Sequence[str],
+        axis_point1: Sequence[float],
+        axis_point2: Sequence[float],
+        keep_source: bool = True,
+        layer: str | None = None,
+        doc_name: str | None = None,
+    ) -> dict[str, Any]:
+        """按镜像轴补全图形；keep_source=False 可只留镜像结果。"""
+        layer = self._layer_for(layer, "outline")
+        if layer:
+            self.ensure_layer(layer, doc_name=doc_name)
+
+        def _do():
+            doc = self._document(doc_name)
+            p1 = _pt(*axis_point1[:3])
+            p2 = _pt(*axis_point2[:3])
+            created, errors = [], []
+            for h in handles:
+                try:
+                    e = dynamic.Dispatch(doc.HandleToObject(str(h)))
+                    new = e.Mirror(p1, p2)
+                    if layer:
+                        try:
+                            dynamic.Dispatch(new).Layer = layer
+                        except Exception:
+                            pass
+                    created.append(self._safe(lambda o=new: str(o.Handle), default=""))
+                    if not keep_source:
+                        try:
+                            e.Delete()
+                        except Exception:
+                            pass
+                except Exception as exc:
+                    errors.append(f"{h}: {exc}")
+            return {"created": created, "errors": errors}
+
+        info = self._call("镜像图元", _do)
+        return {"ok": True, "keep_source": bool(keep_source), "layer": layer,
+                **info, "document": self._last_doc_name}
+
+    def offset_entity(
+        self,
+        handle: str,
+        distance: float,
+        layer: str | None = None,
+        doc_name: str | None = None,
+    ) -> dict[str, Any]:
+        """等距偏移一个图元（距离可为负，表示反向）。"""
+        layer = self._layer_for(layer, "outline")
+        if layer:
+            self.ensure_layer(layer, doc_name=doc_name)
+
+        def _do():
+            doc = self._document(doc_name)
+            e = dynamic.Dispatch(doc.HandleToObject(str(handle)))
+            r = e.Offset(float(distance))
+            out = []
+            for item in (r if isinstance(r, (tuple, list)) else (r,)):
+                if layer:
+                    try:
+                        dynamic.Dispatch(item).Layer = layer
+                    except Exception:
+                        pass
+                out.append(self._safe(lambda o=item: str(o.Handle), default=""))
+            return {"created": out, "distance": float(distance)}
+
+        info = self._call("偏移图元", _do)
+        return {"ok": True, "layer": layer, **info, "document": self._last_doc_name}
+
+    def array_rectangular(
+        self,
+        handle: str,
+        rows: int,
+        cols: int,
+        dist_rows: float,
+        dist_cols: float,
+        levels: int = 1,
+        dist_levels: float = 0.0,
+        layer: str | None = None,
+        doc_name: str | None = None,
+    ) -> dict[str, Any]:
+        """矩形阵列；返回新生成图元句柄（不含原图元）。"""
+        layer = self._layer_for(layer, "outline")
+        if layer:
+            self.ensure_layer(layer, doc_name=doc_name)
+
+        def _do():
+            doc = self._document(doc_name)
+            e = dynamic.Dispatch(doc.HandleToObject(str(handle)))
+            r = e.ArrayRectangular(int(rows), int(cols), int(levels),
+                                   float(dist_rows), float(dist_cols), float(dist_levels))
+            out = []
+            for item in (r if isinstance(r, (tuple, list)) else (r,)):
+                if layer:
+                    try:
+                        dynamic.Dispatch(item).Layer = layer
+                    except Exception:
+                        pass
+                out.append(self._safe(lambda o=item: str(o.Handle), default=""))
+            return {"created": out, "rows": int(rows), "cols": int(cols)}
+
+        info = self._call("矩形阵列", _do)
+        return {"ok": True, "layer": layer, **info, "document": self._last_doc_name}
+
+    def array_polar(
+        self,
+        handle: str,
+        count: int,
+        angle_deg: float = 360.0,
+        center: Sequence[float] = (0.0, 0.0),
+        layer: str | None = None,
+        doc_name: str | None = None,
+    ) -> dict[str, Any]:
+        """环形阵列；angle_deg 用度（内部转弧度）。"""
+        layer = self._layer_for(layer, "outline")
+        if layer:
+            self.ensure_layer(layer, doc_name=doc_name)
+
+        def _do():
+            doc = self._document(doc_name)
+            e = dynamic.Dispatch(doc.HandleToObject(str(handle)))
+            r = e.ArrayPolar(int(count), math.radians(float(angle_deg)),
+                             _pt(*center[:3]))
+            out = []
+            for item in (r if isinstance(r, (tuple, list)) else (r,)):
+                if layer:
+                    try:
+                        dynamic.Dispatch(item).Layer = layer
+                    except Exception:
+                        pass
+                out.append(self._safe(lambda o=item: str(o.Handle), default=""))
+            return {"created": out, "count": int(count), "angle_deg": float(angle_deg)}
+
+        info = self._call("环形阵列", _do)
+        return {"ok": True, "layer": layer, **info, "document": self._last_doc_name}
+
+    def trim_at_points(
+        self,
+        points: Sequence[Sequence[float]],
+        doc_name: str | None = None,
+    ) -> dict[str, Any]:
+        """批量修剪：SendCommand 跑 _.TRIM，接受全部剪切边，依次点选要剪掉的部分。
+
+        实测（probe_v12d）：COM 没有 Trim/Extend/Break 实体方法，只能走命令；
+        第一个 \\n\\n = 回车接受全部作为剪切边，末尾 \\n = 回车结束。
+        """
+        picks = "".join(f"{float(p[0])},{float(p[1])}\n" for p in (points or []))
+
+        def _do():
+            doc = self._document(doc_name)
+            doc.SendCommand("_.TRIM\n\n" + picks + "\n")
+            time.sleep(0.6)
+            return {"picked": len(points or [])}
+
+        info = self._call("批量修剪", _do)
+        return {"ok": True, **info, "document": self._last_doc_name}
+
+    # -- V1.2-3 外部参照管理 -----------------------------------------------
+
+    def list_xrefs(self, doc_name: str | None = None) -> dict[str, Any]:
+        """列出当前图纸里的外部参照块名与路径。"""
+        def _do():
+            doc = self._document(doc_name)
+            out = []
+            for i in range(int(doc.Blocks.Count)):
+                try:
+                    d = dynamic.Dispatch(doc.Blocks.Item(i))
+                    if bool(d.IsXRef):
+                        out.append({"name": str(d.Name), "path": str(d.Path)})
+                except Exception:
+                    continue
+            return {"xrefs": out, "count": len(out)}
+
+        info = self._call("列出外部参照", _do)
+        return {"ok": True, **info, "document": self._last_doc_name}
+
+    def attach_xref(
+        self,
+        path: str,
+        name: str,
+        position: Sequence[float] = (0.0, 0.0),
+        xscale: float = 1.0,
+        yscale: float = 1.0,
+        zscale: float = 1.0,
+        rotation_deg: float = 0.0,
+        overlay: bool = False,
+        doc_name: str | None = None,
+    ) -> dict[str, Any]:
+        """附着一个 DWG 外部参照。"""
+        abs_path = os.path.abspath(str(path))
+
+        def _do():
+            doc = self._document(doc_name)
+            if not os.path.isfile(abs_path):
+                raise CadError(f"外部参照文件不存在：{abs_path}")
+            ref = doc.ModelSpace.AttachExternalReference(
+                abs_path, str(name), _pt(*position[:3]),
+                float(xscale), float(yscale), float(zscale),
+                math.radians(float(rotation_deg)), bool(overlay),
+            )
+            return {"handle": self._safe(lambda: str(ref.Handle), default=""),
+                    "object_name": self._safe(lambda: str(ref.ObjectName), default=""),
+                    "name": str(name), "path": abs_path}
+
+        info = self._call("附着外部参照", _do)
+        return {"ok": True, **info, "document": self._last_doc_name}
+
+    def xref_action(
+        self,
+        name: str,
+        action: str = "reload",
+        new_path: str | None = None,
+        doc_name: str | None = None,
+    ) -> dict[str, Any]:
+        """对外部参照执行 bind / unload / reload / detach / repair。
+
+        实测（probe_v12c）：生命周期方法在 BLOCK 定义（doc.Blocks.Item(name)）
+        上，不在 AcDbBlockReference 实体上。
+        """
+        act = str(action).lower()
+
+        def _do():
+            doc = self._document(doc_name)
+            blk = self._xref_block(doc, name)
+            if act == "bind":
+                blk.Bind(False)
+            elif act == "unload":
+                blk.Unload()
+            elif act == "reload":
+                blk.Reload()
+            elif act == "detach":
+                blk.Detach()
+            elif act in ("repair", "path", "set_path"):
+                if not new_path:
+                    raise CadError("repair 需要 new_path。")
+                blk.Path = os.path.abspath(str(new_path))
+            else:
+                raise CadError(f"不支持的 xref action：{act}（可用 bind/unload/reload/detach/repair）")
+            return {"name": str(name), "action": act,
+                    "is_xref": self._safe(lambda: bool(blk.IsXRef), default=None),
+                    "path": self._safe(lambda: str(blk.Path), default="")}
+
+        info = self._call("外部参照操作", _do)
+        return {"ok": True, **info, "document": self._last_doc_name}
+
+    def repair_xref_paths(
+        self,
+        old_prefix: str,
+        new_prefix: str,
+        doc_name: str | None = None,
+    ) -> dict[str, Any]:
+        """批量路径修复：把以 old_prefix 开头的参照路径换成 new_prefix。"""
+        def _do():
+            doc = self._document(doc_name)
+            changed = []
+            for i in range(int(doc.Blocks.Count)):
+                try:
+                    d = dynamic.Dispatch(doc.Blocks.Item(i))
+                    if not bool(d.IsXRef):
+                        continue
+                    old = str(d.Path)
+                    if old.startswith(str(old_prefix)):
+                        new = str(new_prefix) + old[len(str(old_prefix)):]
+                        d.Path = new
+                        changed.append({"name": str(d.Name), "old": old, "new": new})
+                except Exception:
+                    continue
+            return {"changed": changed, "count": len(changed)}
+
+        info = self._call("批量修复参照路径", _do)
+        return {"ok": True, "old_prefix": str(old_prefix), "new_prefix": str(new_prefix),
+                **info, "document": self._last_doc_name}
+
+    # -- V1.2-1 明细表（BOM） ----------------------------------------------
+
+    def count_blocks(self, doc_name: str | None = None) -> dict[str, Any]:
+        """统计模型空间里的块参照数量，并取一份属性样例（BOM 数据源）。"""
+        def _do():
+            doc = self._document(doc_name)
+            ms = doc.ModelSpace
+            agg: dict[str, dict[str, Any]] = {}
+            total = 0
+            for i in range(int(ms.Count)):
+                try:
+                    e = dynamic.Dispatch(ms.Item(i))
+                    if str(e.ObjectName) != "AcDbBlockReference":
+                        continue
+                    nm = str(e.EffectiveName)
+                except Exception:
+                    continue
+                total += 1
+                item = agg.setdefault(nm, {"name": nm, "count": 0, "attributes": {}})
+                item["count"] += 1
+                if not item["attributes"]:
+                    try:
+                        for a in e.GetAttributes():
+                            ad = dynamic.Dispatch(a)
+                            item["attributes"][str(ad.TagString)] = str(ad.TextString)
+                    except Exception:
+                        pass
+            return {"total_refs": total, "distinct": len(agg),
+                    "items": list(agg.values())}
+
+        info = self._call("统计块", _do)
+        return {"ok": True, **info, "document": self._last_doc_name}
+
+    def generate_bom(
+        self,
+        position: Sequence[float] | None = None,
+        columns: Sequence[str] | None = None,
+        row_height: float = 8.0,
+        col_width: float = 30.0,
+        margin: float = 10.0,
+        layer: str | None = None,
+        doc_name: str | None = None,
+    ) -> dict[str, Any]:
+        """自动统计块 → 生成明细表表格；不给 position 时对齐到图纸右下角。"""
+        layer = self._layer_for(layer, "text")
+        if layer:
+            self.ensure_layer(layer, doc_name=doc_name)
+        cols = [str(c) for c in (columns or ["序号", "名称", "数量", "备注"])]
+
+        def _do():
+            doc = self._document(doc_name)
+            ms = doc.ModelSpace
+            agg: dict[str, dict[str, Any]] = {}
+            total = 0
+            for i in range(int(ms.Count)):
+                try:
+                    e = dynamic.Dispatch(ms.Item(i))
+                    if str(e.ObjectName) != "AcDbBlockReference":
+                        continue
+                    nm = str(e.EffectiveName)
+                except Exception:
+                    continue
+                total += 1
+                item = agg.setdefault(nm, {"name": nm, "count": 0, "attributes": {}})
+                item["count"] += 1
+                if not item["attributes"]:
+                    try:
+                        for a in e.GetAttributes():
+                            ad = dynamic.Dispatch(a)
+                            item["attributes"][str(ad.TagString)] = str(ad.TextString)
+                    except Exception:
+                        pass
+            items = list(agg.values())
+            rows = 1 + len(items)
+            if position:
+                x, y = float(position[0]), float(position[1])
+            else:
+                bounds = self._drawing_bounds(doc)
+                if bounds:
+                    lo, hi = bounds
+                    x = float(hi[0]) - len(cols) * float(col_width) - float(margin)
+                    y = float(lo[1]) + rows * float(row_height) + float(margin)
+                else:
+                    x, y = 0.0, 0.0
+            tbl = ms.AddTable(_pt(x, y), rows, len(cols),
+                              float(row_height), float(col_width))
+            t = dynamic.Dispatch(doc.HandleToObject(str(tbl.Handle)))
+            for c, name in enumerate(cols):
+                self._set_cell(t, 0, c, name)
+            for r, item in enumerate(items, start=1):
+                note = " ".join(f"{k}={v}" for k, v in item["attributes"].items())[:60]
+                vals = [str(r), item["name"], str(item["count"]), note]
+                for c in range(len(cols)):
+                    self._set_cell(t, r, c, vals[c] if c < len(vals) else "")
+            if layer:
+                try:
+                    t.Layer = layer
+                except Exception:
+                    pass
+            return {"handle": self._safe(lambda: str(tbl.Handle), default=""),
+                    "rows": rows, "columns": len(cols), "position": [x, y],
+                    "total_refs": total, "items": items}
+
+        info = self._call("生成明细表", _do)
+        return {"ok": True, "layer": layer, **info, "document": self._last_doc_name}
+
+    # -- V1.2-2 图纸批量处理引擎 -------------------------------------------
+
+    def _unify_in_doc(self, doc: Any, style: str = "", layer: str = "") -> dict[str, Any]:
+        if style:
+            try:
+                doc.TextStyles.Item(style)
+            except Exception:
+                s = doc.TextStyles.Add(style)
+                ds = dynamic.Dispatch(s)
+                try:
+                    ds.fontFile = CN_FONT
+                except Exception:
+                    pass
+                try:
+                    ds.bigFontFile = CN_BIGFONT
+                except Exception:
+                    pass
+        ms = doc.ModelSpace
+        lc = sc = failed = 0
+        for i in range(int(ms.Count)):
+            try:
+                e = dynamic.Dispatch(ms.Item(i))
+                if layer:
+                    e.Layer = layer
+                    lc += 1
+                if style and str(e.ObjectName) in ("AcDbText", "AcDbMText"):
+                    e.StyleName = style
+                    sc += 1
+            except Exception:
+                failed += 1
+        return {"layer_changed": lc, "style_changed": sc, "failed": failed}
+
+    def unify_styles(
+        self,
+        style: str = "",
+        layer: str = "",
+        doc_name: str | None = None,
+    ) -> dict[str, Any]:
+        """批量统一字体样式 / 图层（样式不存在时自动建中文大字体）。"""
+        def _do():
+            doc = self._document(doc_name)
+            return self._unify_in_doc(doc, str(style or ""), str(layer or ""))
+
+        info = self._call("统一字体/图层", _do)
+        return {"ok": True, "style": style, "layer": layer,
+                **info, "document": self._last_doc_name}
+
+    def export_dxf(self, path: str, doc_name: str | None = None) -> dict[str, Any]:
+        """当前图纸导出 DXF。实测 FileName 必须不带扩展名，AutoCAD 自己补 .dxf。"""
+        base = os.path.abspath(str(path))
+        if base.lower().endswith(".dxf"):
+            base = base[:-4]
+        os.makedirs(os.path.dirname(base), exist_ok=True)
+
+        def _do():
+            doc = self._document(doc_name)
+            s = self._select_all(doc)
+            try:
+                doc.Export(base, "DXF", s)
+            finally:
+                try:
+                    s.Delete()
+                except Exception:
+                    pass
+            return True
+
+        self._call("导出 DXF", _do)
+        final = base + ".dxf"
+        return {"ok": True, "format": "dxf", "path": final,
+                "size": self._fsize(final), "document": self._last_doc_name}
+
+    def export_dwg(self, path: str, doc_name: str | None = None) -> dict[str, Any]:
+        """当前图纸用 Wblock 导出 DWG（全选图元）。"""
+        final = os.path.abspath(str(path))
+        if not final.lower().endswith(".dwg"):
+            final += ".dwg"
+        os.makedirs(os.path.dirname(final), exist_ok=True)
+
+        def _do():
+            doc = self._document(doc_name)
+            s = self._select_all(doc)
+            try:
+                doc.Wblock(final, s)
+            finally:
+                try:
+                    s.Delete()
+                except Exception:
+                    pass
+            return True
+
+        self._call("导出 DWG", _do)
+        return {"ok": True, "format": "dwg", "path": final,
+                "size": self._fsize(final), "document": self._last_doc_name}
+
+    def export_pdf(self, path: str, doc_name: str | None = None) -> dict[str, Any]:
+        """当前图纸高清打印成 PDF（DWG To PDF.pc3 + 按范围）。"""
+        final = os.path.abspath(str(path))
+        if not final.lower().endswith(".pdf"):
+            final += ".pdf"
+        os.makedirs(os.path.dirname(final), exist_ok=True)
+
+        def _do():
+            doc = self._document(doc_name)
+            lay = dynamic.Dispatch(doc.ActiveLayout)
+            old = self._safe(lambda: str(lay.ConfigName), default="")
+            lay.ConfigName = "DWG To PDF.pc3"
+            doc.SetVariable("BACKGROUNDPLOT", 0)
+            lay.PlotType = 1  # acExtents
+            doc.Plot.PlotToFile(final)  # 实测不传第二个 config 参数
+            return {"previous_config": old, "config": "DWG To PDF.pc3"}
+
+        info = self._call("导出 PDF", _do)
+        return {"ok": True, "format": "pdf", "path": final,
+                "size": self._fsize(final), **info,
+                "document": self._last_doc_name}
+
+    def _convert_one(
+        self,
+        src: str,
+        out_dir: str,
+        formats: Sequence[str],
+        unify: bool,
+        close_after: bool,
+    ) -> dict[str, Any]:
+        app = self._app
+        existing = None
+        for i in range(int(app.Documents.Count)):
+            try:
+                d = app.Documents.Item(i)
+                if str(d.FullName).lower() == str(src).lower():
+                    existing = d
+                    break
+            except Exception:
+                continue
+        # 实测（live_v12_batch_debug）：对已打开的文档再调 Documents.Open(src)
+        # 会新建一个重复的文档视图，累积后 COM 状态混乱导致批量偶发失败。
+        # 已打开就复用、不再 Open；这类文档属于用户/前序流程，结束时也不关闭。
+        if existing is not None:
+            doc = existing
+            already = True
+        else:
+            doc = app.Documents.Open(src)
+            already = False
+        app.ActiveDocument = doc
+        base = os.path.splitext(os.path.basename(src))[0]
+        outputs: dict[str, Any] = {}
+        try:
+            if unify:
+                self._unify_in_doc(doc, "DSH-CN", "")
+            s = self._select_all(doc)
+            try:
+                for f in formats:
+                    f = str(f).lower()
+                    if f == "dxf":
+                        p = os.path.join(out_dir, base)
+                        doc.Export(p, "DXF", s)
+                        outputs["dxf"] = {"path": p + ".dxf", "size": self._fsize(p + ".dxf")}
+                    elif f == "dwg":
+                        p = os.path.join(out_dir, base + "_wblock.dwg")
+                        doc.Wblock(p, s)
+                        outputs["dwg"] = {"path": p, "size": self._fsize(p)}
+                    elif f == "pdf":
+                        p = os.path.join(out_dir, base + ".pdf")
+                        lay = dynamic.Dispatch(doc.ActiveLayout)
+                        lay.ConfigName = "DWG To PDF.pc3"
+                        doc.SetVariable("BACKGROUNDPLOT", 0)
+                        lay.PlotType = 1
+                        doc.Plot.PlotToFile(p)
+                        outputs["pdf"] = {"path": p, "size": self._fsize(p)}
+                    else:
+                        outputs[f] = {"error": "不支持的格式（可用 dxf/dwg/pdf）"}
+            finally:
+                try:
+                    s.Delete()
+                except Exception:
+                    pass
+        finally:
+            if close_after and not already:
+                try:
+                    doc.Close(False)
+                except Exception:
+                    pass
+        return {"base": base, "outputs": outputs,
+                "closed": bool(close_after and not already)}
+
+    def batch_convert(
+        self,
+        paths: Sequence[str],
+        out_dir: str,
+        formats: Sequence[str] | None = None,
+        unify: bool = False,
+        close_after: bool = True,
+    ) -> dict[str, Any]:
+        """「一句话交付」：批量打开整套图纸 → 每种格式导出 → 关闭。
+
+        每个文档单独一次 _call（避免单次 STA 超时）；SelectionSet 名全局唯一。
+        """
+        fmts = [str(f) for f in (formats or ["dxf", "dwg", "pdf"])]
+        os.makedirs(os.path.abspath(out_dir), exist_ok=True)
+        results = []
+        for p in paths or []:
+            abs_in = os.path.abspath(str(p))
+            if not os.path.isfile(abs_in):
+                results.append({"input": str(p), "ok": False, "error": "文件不存在"})
+                continue
+            try:
+                r = self._call(
+                    f"批量处理 {os.path.basename(abs_in)}",
+                    lambda src=abs_in: self._convert_one(
+                        src, os.path.abspath(out_dir), fmts, bool(unify), bool(close_after)
+                    ),
+                    retries=12,
+                    retry_delay_s=0.6,
+                    timeout_s=180.0,
+                )
+                results.append({"input": str(p), "ok": True, **r})
+            except Exception as exc:
+                results.append({"input": str(p), "ok": False, "error": str(exc)})
+        ok = sum(1 for r in results if r.get("ok"))
+        return {"ok": True, "out_dir": os.path.abspath(out_dir), "formats": fmts,
+                "succeeded": ok, "failed": len(results) - ok, "results": results}
 
     # -- 读取 --------------------------------------------------------------
 

@@ -1,11 +1,12 @@
 # DSH AutoCAD Bridge
 
-Give **AutoCAD 2024** to a DeepSeek Harness agent as a pair of hands: query status, draw entities, manage layers, **GB-standard dimensions**, blocks with attributes, MText / geometric tolerances, send native commands, build 3D solids — all through MCP tool calls. Ships with a **control panel** that owns the bridge process: start/stop/restart, settings, a status light and live logs.
+Give **AutoCAD 2024** to a DeepSeek Harness agent as a pair of hands: query status, draw entities, manage layers, **GB-standard dimensions**, blocks with attributes, MText / geometric tolerances, mechanical aids, xrefs, auto-BOM and **batch DXF/DWG/PDF delivery** — all through MCP tool calls. Ships with a **control panel** that owns the bridge process: start/stop/restart, settings, a status light and live logs.
 
-**Current version 1.1.0** (V1.1 industrial foundations): 39 tools, one call to
-set up the mechanical drafting environment, then draw + auto-dimension +
-auto-layer. Roadmap: [docs/ROADMAP.md](docs/ROADMAP.md); changes:
-[CHANGELOG.md](CHANGELOG.md).
+**Current version 1.2.0** (V1.2 non-standard automation toolkit): 56 tools,
+one call to batch-organise a whole set of equipment drawings, generate the BOM
+and deliver PDFs; V1.1's "set up the drafting environment + draw + auto-dimension
++ auto-layer" is also one call. Roadmap: [docs/ROADMAP.md](docs/ROADMAP.md);
+changes: [CHANGELOG.md](CHANGELOG.md).
 
 > 中文: [README.md](README.md)
 
@@ -65,7 +66,7 @@ One sidebar icon, one full central panel:
 - **Dependency bootstrap** — builds a virtual environment in your data directory and installs pywin32 / mcp / python-dotenv on demand
 - **Discovery** — finds Python and the bridge directory, detects which AutoCAD ProgIDs your machine actually registers
 
-### 39 agent tools
+### 56 agent tools
 
 #### Base (V1.0, 18 — all kept)
 
@@ -115,6 +116,41 @@ One sidebar icon, one full central panel:
 | Block | `cad_replace_block` | Bulk-replace references |
 | Text | `cad_add_mtext` | Multi-line text (incl. stacked tolerances) |
 | Text | `cad_add_tolerance` | Geometric tolerance frame |
+
+#### V1.2 non-standard automation (17)
+
+| Group | Tool | Purpose |
+|---|---|---|
+| Mechanical | `cad_add_centerlines` | Auto centre lines from two rectangle corners |
+| Mechanical | `cad_mirror_entities` | Mirror geometry about an axis |
+| Mechanical | `cad_offset_entity` | Offset one entity by a distance |
+| Mechanical | `cad_array_rectangular` | Rectangular array |
+| Mechanical | `cad_array_polar` | Polar array (angle in degrees) |
+| Mechanical | `cad_trim_at_points` | Batch trim via native `_.TRIM` |
+| Xref | `cad_list_xrefs` | List xrefs and their paths |
+| Xref | `cad_attach_xref` | Attach a DWG xref |
+| Xref | `cad_xref_action` | Bind / unload / reload / detach / repair one xref |
+| Xref | `cad_repair_xref_paths` | Bulk-fix path prefixes |
+| BOM | `cad_count_blocks` | Count block references + attribute samples |
+| BOM | `cad_generate_bom` | Auto BOM table (optionally bottom-right aligned) |
+| Batch | `cad_unify_styles` | Unify text styles / layers |
+| Batch | `cad_export_dxf` | Export current drawing to DXF |
+| Batch | `cad_export_dwg` | Export current drawing to DWG (Wblock) |
+| Batch | `cad_export_pdf` | Plot current drawing to PDF |
+| Batch | `cad_batch_convert` | **One call: organise a drawing set + BOM + PDF delivery** |
+
+#### One call to deliver a whole drawing set
+
+```
+cad_batch_convert(paths=[...], out_dir=..., formats=["dxf","dwg","pdf"])
+    -> open each, unify fonts, export all three formats, close
+cad_generate_bom()                 -> count blocks, build BOM, bottom-right align
+cad_unify_styles(style="DSH-CN")  -> bulk-unify fonts / layers
+```
+
+`cad_batch_convert` gives each document its own STA call, a globally unique
+SelectionSet name, and a wider BUSY retry window (after consecutive exports
+AutoCAD stays busy for 2–5 s); 3 drawings in a row verified 3/3.
 
 #### One call to a part drawing
 
@@ -237,6 +273,9 @@ Output lands in `examples/out/`. **Make sure AutoCAD is running and idle first**
   worker has been stuck, and `cad_reconnect` rebuilds the connection.
 - **Serial by design** — all COM calls queue through one STA thread. Concurrent calls are safe, not faster: AutoCAD itself is single-threaded.
 - **No visual verification** — the bridge draws. Whether it looks right is a separate question.
+- **Batch export is serial and has no transactional rollback** — after consecutive
+  exports AutoCAD stays busy 2–5 s; `cad_batch_convert` uses a wider retry window,
+  but a failed run may still leave partial output to clean up (see [limitations](docs/limitations.md)).
 - **The panel's pixel rendering is not automatically verified** — its logic is covered by headless tests, but the appearance needs a human glance (see [limitations](docs/limitations.md)).
 
 ---

@@ -10,6 +10,54 @@ full backward compatibility with tools shipped in earlier versions.
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-09
+
+V1.2 「非标自动化专用工具集」。工具数从 39 增至 **56**，全部通过 live
+AutoCAD 2024 端到端实测（`bridge/live_v12_test.py` 冷启动 29/29 全绿，含
+CAD 自动唤醒）。向下兼容：1.0.0/1.1.0 里所有 `mcp__autocad__*` 工具名、
+参数与返回结构保持不变。交付标准达成：AI 一句话「批量整理整套设备图纸、
+自动出 BOM、自动转 PDF 交付」。
+
+### Added — V1.2 非标自动化
+
+- **机械辅助（V1.2-4）** 6 工具，全部按大类自动归属图层：
+  - `cad_add_centerlines` — 按矩形两角自动生成居中 H/V 中心线（落「中心线」层）
+  - `cad_mirror_entities` — 按镜像轴补全图形，可只留镜像结果
+  - `cad_offset_entity` — 等距偏移（距离可为负）
+  - `cad_array_rectangular` / `cad_array_polar` — 矩形/环形阵列，角度用度
+  - `cad_trim_at_points` — 批量修剪（实测 COM 无 Trim/Extend/Break 实体方法，
+    走 `doc.SendCommand("_.TRIM\n\n…\n")`）
+- **外部参照管理（V1.2-3）** 4 工具：`cad_list_xrefs` / `cad_attach_xref` /
+  `cad_xref_action`（bind/unload/reload/detach/repair）/ `cad_repair_xref_paths`。
+  实测生命周期方法在 **BLOCK 定义**（`doc.Blocks.Item(name)`）上，不在
+  `AcDbBlockReference` 实体上。
+- **明细表 BOM（V1.2-1）** 2 工具：`cad_count_blocks`（按 `EffectiveName`
+  聚合块参照数量 + 属性样例）/ `cad_generate_bom`（自动统计 → `AddTable`
+  明细表，不给位置时用 `GetBoundingBox` 遍历求全图范围、对齐图纸右下角）。
+- **批量处理引擎（V1.2-2）** 5 工具：`cad_unify_styles`（统一字体样式/图层）、
+  `cad_export_dxf`（`Export(无扩展名路径,"DXF",ss)`，AutoCAD 自己补 `.dxf`）、
+  `cad_export_dwg`（`Wblock`）、`cad_export_pdf`（`DWG To PDF.pc3` +
+  `BACKGROUNDPLOT=0` + `PlotType=1` + `Plot.PlotToFile`）、`cad_batch_convert`
+  （一句话批量打开整套图纸 → 三格式导出 → 关闭）。
+
+### Fixed — V1.2 实测暴露的真实缺陷
+
+- `_convert_one` 对**已打开的文档**仍调 `Documents.Open(src)`，会新建重复文档
+  视图、累积后 COM 状态混乱导致批量偶发失败 → 改为按 `FullName` 复用已打开
+  文档、结束时不关闭属于用户的那一份。
+- `_call` 默认 `retry_times=2 × 0.8s` 的 BUSY 窗口对单条绘图命令够用，但连续
+  DXF/Wblock/PDF 导出后 CAD 后台收尾会忙 2~5 秒 → 给 `_call` 加可选
+  `retries / retry_delay_s / timeout_s` 覆盖，**仅 `batch_convert`** 用
+  12×0.6s + 180s；不传时行为与 V1.1 完全一致（向下兼容）。
+- SelectionSet 必须全局唯一名 + 用 `col.Add()` 返回的**裸对象**调 `Select(5)`
+  （`dynamic.Dispatch(ss)` 会丢 Select）；用完 `Delete()`。
+
+### Changed
+
+- `MCPServer` 的 description/instructions 增加 V1.2 四组能力说明与
+  「一句话交付」用法。
+- `bundle-autocad-ui/package.json` 版本升 `1.2.0`。
+
 ## [1.1.0] - 2026-11-09
 
 V1.1 「工业基础能力补全」。工具数从 18 增至 **39**，全部通过 live AutoCAD
