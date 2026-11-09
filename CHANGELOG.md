@@ -17,6 +17,13 @@ full backward compatibility with tools shipped in earlier versions.
   Passing an explicit `layer="0"` in Phase A removes the previous cold-start
   dependency (the `auto_layer_by_kind` switch is process-global), so the test
   is repeatable against a warm bridge. Recorded in `docs/architecture.md`.
+- `tests/test_roadmap_acceptance.py`: a 50-assertion live test that encodes
+  each ROADMAP version's one-sentence 交付标准 as a repeatable check —
+  V1.1 (three-view drawing + six dimension kinds + GB layers + Chinese MText),
+  V1.2 (BOM + batch DXF/DWG/PDF with on-disk size verification), V1.3
+  (dimensions → 2D three views + 3D model + verified viewport switches).
+  All artifacts go to `%TEMP%\dsh_roadmap_acceptance`. Recorded in
+  `docs/architecture.md` and `tests/README.md`.
 
 ## [1.3.0] - 2026-11-09
 

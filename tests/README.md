@@ -1,5 +1,55 @@
 # Tests
 
+## Tests
+
+Two live, status-independent acceptance scripts. Both need the bridge up on
+`127.0.0.1:8770` and the bridge's own virtualenv; both exit `0` only when
+every assertion passes; both can be run repeatedly against one warm process.
+
+| Script | Checks | What it locks down |
+|---|---|---|
+| `test_backward_compat.py` | 32 | ROADMAP「向下兼容 / 可生产使用」：四个版本工具混调 |
+| `test_roadmap_acceptance.py` | 50 | ROADMAP 三条「一句话交付标准」逐版本 live 验收 |
+
+### ROADMAP delivery-standard acceptance
+
+`test_roadmap_acceptance.py` turns each version's 交付标准 into a repeatable
+live check (see [docs/ROADMAP.md](../docs/ROADMAP.md)):
+
+- **V1.1 生成机械零件三视图 + 自动标注 + 分层规范** — 3 orthographic
+  rectangles, all six GB layers, auto-assignment to 「轮廓」, all six dimension
+  kinds (linear-H/V, aligned, radial, diametric, angular, ordinate) with exact
+  measurements 120/80, and Chinese MText technical requirements.
+- **V1.2 批量整理整套设备图纸、自动出 BOM、自动转 PDF 交付** — attribute
+  blocks → `count_blocks` → auto BOM aligned to the sheet corner → two source
+  DWGs → single-doc DXF/PDF → `batch_convert` over the whole set → every DXF,
+  DWG and PDF verified non-empty **on disk** (`os.path.getsize`).
+- **V1.3 输入零件尺寸 → 自动 2D 三视图 + 自动 3D 模型** — 2D three-view
+  rectangles + `dimensions_to_3d(44,28,40)` with iso view + shading →
+  `solid_info` → front/top/right `VIEWDIR` verification → `profile_to_3d`
+  thickness 12 → 2D and 3D coexist on one drawing.
+
+```powershell
+& "F:\DSH对CAD2024插件\bridge\.venv\Scripts\python.exe" `
+  "F:\DSH对CAD2024插件\tests\test_roadmap_acceptance.py"
+```
+
+Expected output ends with:
+
+```
+=== ROADMAP ACCEPTANCE: PASS=50 FAIL=0 total=50 ===
+  [meta]: 1/1
+  [V1.1]: 20/20
+  [V1.2]: 17/17
+  [V1.3]: 12/12
+```
+
+Artifacts are written to `%TEMP%\dsh_roadmap_acceptance` (cleared at the start
+of each run, kept afterwards for manual inspection). Verified: two consecutive
+runs, 50/50 each, on fresh drawings with no bridge restart.
+
+---
+
 ## Cross-version backward-compatibility regression
 
 `test_backward_compat.py` is the durable regression for the ROADMAP's
