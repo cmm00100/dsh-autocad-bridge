@@ -1,6 +1,11 @@
 # DSH AutoCAD Bridge
 
-Give **AutoCAD 2024** to a DeepSeek Harness agent as a pair of hands: query status, draw entities, manage layers, send native commands, build 3D solids — all through MCP tool calls. Ships with a **control panel** that owns the bridge process: start/stop/restart, settings, a status light and live logs.
+Give **AutoCAD 2024** to a DeepSeek Harness agent as a pair of hands: query status, draw entities, manage layers, **GB-standard dimensions**, blocks with attributes, MText / geometric tolerances, send native commands, build 3D solids — all through MCP tool calls. Ships with a **control panel** that owns the bridge process: start/stop/restart, settings, a status light and live logs.
+
+**Current version 1.1.0** (V1.1 industrial foundations): 39 tools, one call to
+set up the mechanical drafting environment, then draw + auto-dimension +
+auto-layer. Roadmap: [docs/ROADMAP.md](docs/ROADMAP.md); changes:
+[CHANGELOG.md](CHANGELOG.md).
 
 > 中文: [README.md](README.md)
 
@@ -60,13 +65,16 @@ One sidebar icon, one full central panel:
 - **Dependency bootstrap** — builds a virtual environment in your data directory and installs pywin32 / mcp / python-dotenv on demand
 - **Discovery** — finds Python and the bridge directory, detects which AutoCAD ProgIDs your machine actually registers
 
-### 18 agent tools
+### 39 agent tools
+
+#### Base (V1.0, 18 — all kept)
 
 | Tool | Purpose |
 |---|---|
 | `cad_connect` | Connect (launches AutoCAD through COM when it is not running) |
-| `cad_status` | `disconnected` / `idle` / `busy` / `error` |
+| `cad_status` | `disconnected` / `idle` / `busy` / `error`, plus queue health |
 | `cad_escape` | Send ESC to cancel a command and dismiss a modal dialog |
+| `cad_reconnect` | Rebuild the COM connection after a hang/timeout (V1.1) |
 | `cad_list_progids` | ProgIDs actually present in the registry |
 | `cad_list_documents` | Open DWGs, marking the active one |
 | `cad_new_document` | New drawing (optional dwt template) |
@@ -83,7 +91,48 @@ One sidebar icon, one full central panel:
 | `cad_list_entities` | Model-space entities (type / layer / handle) |
 | `cad_zoom_extents` | Zoom to extents |
 
-3D solids (`AddBox` / `AddCylinder` / `Boolean` / `Rotate3D`) are driven through `cad_send_command` with a Python script — see [Examples](#examples).
+#### V1.1 industrial foundations (21)
+
+| Group | Tool | Purpose |
+|---|---|---|
+| Dim | `cad_setup_text_style` | Chinese text style (`gbenor.shx` + `gbcbig.shx`) |
+| Dim | `cad_setup_gb_dim_style` | GB dimension style (24 `DIM*` variables) |
+| Dim | `cad_add_dim_linear` | Linear / horizontal / vertical |
+| Dim | `cad_add_dim_aligned` | Aligned |
+| Dim | `cad_add_dim_radial` | Radius |
+| Dim | `cad_add_dim_diametric` | Diameter |
+| Dim | `cad_add_dim_angular` | Angular |
+| Dim | `cad_add_dim_ordinate` | Ordinate |
+| Layer | `cad_setup_standard_layers` | Create all 6 mechanical standard layers |
+| Layer | `cad_set_layer_state` | Bulk lock / freeze / colour / lineweight / active |
+| Layer | `cad_set_active_layer` | Switch the current layer |
+| Env | `cad_setup_mechanical_environment` | **One call to set up the whole environment** |
+| Block | `cad_list_blocks` | Block definitions |
+| Block | `cad_create_block` | New block (with attributes), idempotent |
+| Block | `cad_insert_block` | Insert; override attributes, rotate, scale |
+| Block | `cad_list_block_attributes` | Read a reference's attributes |
+| Block | `cad_set_block_attribute` | Change one attribute value |
+| Block | `cad_replace_block` | Bulk-replace references |
+| Text | `cad_add_mtext` | Multi-line text (incl. stacked tolerances) |
+| Text | `cad_add_tolerance` | Geometric tolerance frame |
+
+#### One call to a part drawing
+
+```
+cad_setup_mechanical_environment   -> layers, fonts, GB dim style, auto-layering on
+cad_add_rectangle / cad_add_circle -> outlines land on the "outline" layer
+cad_add_dim_linear / ...           -> dimensions land on the "dimension" layer
+cad_zoom_extents                   -> fit
+```
+
+All angles are in **degrees** (converted to radians internally). Dimensions
+auto-land on the "dimension" layer and accept text overrides. Auto-layering is
+off by default and only turns on after `cad_setup_mechanical_environment` — a
+deliberate backward-compatibility choice.
+
+3D solids (`AddBox` / `AddCylinder` / `Boolean` / `Rotate3D`) are driven through
+`cad_send_command` with a Python script — see [Examples](#examples). Native 3D
+tools are planned for V1.3, see [ROADMAP](docs/ROADMAP.md).
 
 ---
 
@@ -180,8 +229,12 @@ Output lands in `examples/out/`. **Make sure AutoCAD is running and idle first**
 ## Known limitations
 
 - **Windows only** — COM.
-- **AutoCAD must be running** — silent background COM is unreliable; the plugin launches it with a window.
-- **Modal dialogs freeze COM** — every call stalls until dismissed; `cad_escape` is the escape hatch.
+- **AutoCAD must be a desktop process** — the bridge auto-launches `acad.exe`
+  over COM (V1.1 cold-start wake-up verified: ~15 s after a forced kill), but
+  silent background COM is still unreliable. Keep the CAD window open.
+- **Modal dialogs freeze COM** — every call stalls until dismissed. `cad_escape`
+  is the escape hatch; `cad_status` now reports queue backlog and how long the
+  worker has been stuck, and `cad_reconnect` rebuilds the connection.
 - **Serial by design** — all COM calls queue through one STA thread. Concurrent calls are safe, not faster: AutoCAD itself is single-threaded.
 - **No visual verification** — the bridge draws. Whether it looks right is a separate question.
 - **The panel's pixel rendering is not automatically verified** — its logic is covered by headless tests, but the appearance needs a human glance (see [limitations](docs/limitations.md)).

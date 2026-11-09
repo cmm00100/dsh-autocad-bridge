@@ -69,6 +69,16 @@ ProgID 对应关系：
 
 如果一直忙，多半是**弹了个模态对话框**（未保存提示、许可证、插件更新）。CAD 里按下 ESC，或让 Agent 调 `cad_escape`。
 
+V1.1 起可以先调 `cad_status` 看 `queue` 字段：`busy_seconds` 是 COM 线程已卡
+多久、`pending` 是排队等着的调用数、`last_error` 是最近一次超时。确认长
+期卡死后调 `cad_reconnect` ——它会丢弃旧连接、换一个新的 STA 工作线程重建
+（被卡住的旧线程是 daemon，不会被等待）。
+
+冷启动（CAD 本来没开）时 `cad_connect` 会自动拉起 `acad.exe` 并等待就绪，
+约 15 秒，属正常现象；期间日志里可能出现
+`TypeError: This COM object can not automate the makepy process`，桥已对此
+做了重试兜底，不必手动干预。
+
 ### 第四步：`尚未调用 CoInitialize`
 
 **这个错不应该再出现。** 如果出现了，说明桥的版本落后——当前实现用单 STA 线程 + 命令队列，所有 COM 调用都在同一个已初始化的线程上。检查 `bridge/cad_com.py` 里有没有 `_ComWorker` 类。

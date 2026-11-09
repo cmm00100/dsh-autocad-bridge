@@ -27,7 +27,7 @@ from typing import Any, Iterable, Sequence
 import pythoncom
 import pywintypes
 import win32com.client
-from win32com.client import VARIANT, gencache
+from win32com.client import VARIANT, dynamic, gencache
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -56,6 +56,63 @@ ACAD_COLOR_INDEX = {
     "white": 7,
     "gray": 8,
     "grey": 8,
+}
+
+# ---------------------------------------------------------------------------
+# V1.1 工业基础：机械制图国标（GB）默认图层 / 标注样式
+# ---------------------------------------------------------------------------
+
+#: 机械制图常用标准图层（GB/T 14689 等）。lineweight 单位 1/100 mm，
+#: linetype 用 AutoCAD 自带线型名（CENTER / DASHED 需先从 acad.lin 载入）。
+GB_LAYERS: dict[str, dict[str, Any]] = {
+    "轮廓": {"color": 7, "lineweight": 50, "linetype": "Continuous"},
+    "中心线": {"color": 1, "lineweight": 18, "linetype": "CENTER"},
+    "虚线": {"color": 2, "lineweight": 18, "linetype": "DASHED"},
+    "标注": {"color": 3, "lineweight": 18, "linetype": "Continuous"},
+    "文字": {"color": 7, "lineweight": 25, "linetype": "Continuous"},
+    "剖面线": {"color": 8, "lineweight": 18, "linetype": "Continuous"},
+}
+
+#: 国标标注样式默认尺寸变量（在激活 DimStyle 之后设置，再 CopyFrom 固化）。
+#: 角度一律是"度"由调用方转换；DIMLFAC 默认 1（几何单位=标注单位）。
+GB_DIM_VARS: dict[str, Any] = {
+    "DIMTXT": 3.5,      # 标注文字高
+    "DIMASZ": 2.5,      # 箭头大小
+    "DIMEXE": 1.5,      # 尺寸界线超出量
+    "DIMEXO": 1.0,      # 尺寸界线偏移
+    "DIMGAP": 1.0,      # 文字与尺寸线间隙
+    "DIMDEC": 0,        # 小数位
+    "DIMZIN": 0,        # 不消零
+    "DIMSCALE": 1.0,    # 全局比例
+    "DIMTAD": 1,        # 文字在尺寸线上方
+    "DIMTIH": 0,        # 文字不强制水平（对齐标注）
+    "DIMTOH": 0,
+    "DIMTIX": 0,        # 文字可放在尺寸线之间
+    "DIMSOXD": 0,       # 允许画外侧尺寸线
+    "DIMLFAC": 1.0,     # 测量单位比例
+    "DIMASSOC": 2,      # 关联标注
+    "DIMLUNIT": 2,      # 十进制
+    "DIMCLRD": 7,       # 尺寸线颜色
+    "DIMCLRE": 7,       # 尺寸界线颜色
+    "DIMCLRT": 7,       # 文字颜色
+    "DIMBLK": ".",      # 默认实心箭头
+    "DIMLDRBLK": ".",   # 引线箭头
+    "DIMAUNIT": 0,      # 角度：十进制度
+    "DIMFRAC": 0,
+}
+
+#: 中文工程字：西文 gbenor.shx + 中文大字体 gbcbig.shx（AutoCAD 2024 实测可用）
+CN_FONT = "gbenor.shx"
+CN_BIGFONT = "gbcbig.shx"
+
+#: 图元大类 → 标准图层（setup_standard_layers 之后启用"自动归属"）
+DEFAULT_LAYER_BY_KIND: dict[str, str] = {
+    "outline": "轮廓",
+    "center": "中心线",
+    "hidden": "虚线",
+    "dim": "标注",
+    "text": "文字",
+    "hatch": "剖面线",
 }
 
 
@@ -151,6 +208,12 @@ class _ComWorker:
         self._thread: threading.Thread | None = None
         self._closed = False
         self._thread_lock = threading.Lock()
+        # V1.1-5：可观测的队列/线程状态。worker 一旦卡在 COM 调用里（模态弹窗），
+        # 后续所有 submit 都会排队超时 —— 必须能看出来，才能「超时重连」。
+        self._state_lock = threading.Lock()
+        self._pending = 0
+        self._busy_since: float | None = None
+        self._last_error: str | None = None
 
     def _ensure_thread(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -172,11 +235,17 @@ class _ComWorker:
                 if item is None:
                     break
                 fn, done, box = item
+                with self._state_lock:
+                    self._busy_since = time.monotonic()
                 try:
                     box.append((True, fn()))
                 except BaseException as exc:  # noqa: BLE001
                     box.append((False, exc))
                 finally:
+                    with self._state_lock:
+                        self._pending = max(0, self._pending - 1)
+                        if self._pending == 0:
+                            self._busy_since = None
                     done.set()
         finally:
             try:
@@ -191,16 +260,50 @@ class _ComWorker:
         self._ensure_thread()
         done = threading.Event()
         box: list = []
+        with self._state_lock:
+            self._pending += 1
         self._queue.put((fn, done, box))
         if not done.wait(timeout_s):
+            with self._state_lock:
+                self._last_error = f"last submit timed out after {timeout_s:.0f}s"
+                busy_for = (time.monotonic() - self._busy_since) if self._busy_since else None
             raise CadBusyError(
                 f"AutoCAD 在 {timeout_s:.0f}s 内没有响应（可能有模态弹窗）。"
-                "请切到 CAD 窗口按 ESC 后重试。"
+                f"当前 COM 线程已忙 {busy_for:.0f}s，队列积压 {self._pending} 个调用。"
+                "请切到 CAD 窗口按 ESC 关掉弹窗；若长期卡死可调用 cad_reconnect 重建连接。"
             )
+        with self._state_lock:
+            self._last_error = None
         ok, value = box[0]
         if ok:
             return value
         raise value
+
+    def health(self) -> dict[str, Any]:
+        """V1.1-5：队列/线程健康快照，供 status() 与故障排查用。"""
+        with self._state_lock:
+            busy_since = self._busy_since
+            return {
+                "alive": bool(self._thread is not None and self._thread.is_alive()),
+                "pending": self._pending,
+                "busy_seconds": round(time.monotonic() - busy_since, 1) if busy_since else 0.0,
+                "last_error": self._last_error,
+            }
+
+    def abandon(self) -> None:
+        """
+        V1.1-5：丢弃这个 worker（不 join —— 它可能正卡在模态弹窗里）。
+
+        Python 无法强杀线程，但旧线程是 daemon，且它持有的 COM 指针会随
+        CadBridge 换用新 worker 而被 GC。发哨兵让它在脱困后自行退出。
+        """
+        self._closed = True
+        t = self._thread
+        if t is not None and t.is_alive():
+            try:
+                self._queue.put(None)
+            except Exception:
+                pass
 
     @property
     def ident(self) -> int | None:
@@ -247,6 +350,13 @@ class CadBridge:
         self._worker = _ComWorker()
         self._lock = threading.RLock()
         self._last_doc_name: str | None = None
+        # V1.1-2：默认图层（由 autocad_server 从 settings.default_layer 注入）。
+        # 图元/标注/文字未显式指定 layer 时自动归属到这里，实现"自动分层"。
+        self.default_layer: str = ""
+        # V1.1-2：按图元大类自动分层（outline/center/hidden/dim/text/hatch）。
+        # 默认关闭 —— 保持「省略 layer 就用 CAD 当前图层」的向下兼容行为；
+        # setup_mechanical_environment() 会把它打开，实现"一句话分层规范"。
+        self.auto_layer_by_kind: bool = False
 
     # -- 生命周期 ----------------------------------------------------------
 
@@ -265,58 +375,92 @@ class CadBridge:
         self._com_threads.add(tid)
         self._com_ready = True
 
-    def _on_com(self, fn):
+    def _on_com(self, fn, timeout_s: float | None = None):
         """
         在专用 COM 线程上执行 fn。
 
         如果当前已经在 COM 线程上（例如 connect 内部再调 list_documents），
         就直接执行，否则会自己等自己，死锁。
+
+        timeout_s 可覆盖默认超时；connect() 的启动等待会用更长的预算。
         """
         if self._worker.ident is not None and self._worker.ident == threading.get_ident():
             return fn()
-        return self._worker.submit(
-            fn, timeout_s=(self.timeout_ms / 1000.0) * max(2, self.retry_times)
-        )
+        if timeout_s is None:
+            timeout_s = (self.timeout_ms / 1000.0) * max(2, self.retry_times)
+        return self._worker.submit(fn, timeout_s=timeout_s)
 
     def connect(self, visible: bool = True) -> dict[str, Any]:
         """
         连接（或启动）AutoCAD。
 
-        返回 {"ok": True, "version": ..., "prog_id": ..., "documents": [...]}
-        失败抛 CadDisconnectedError，并给出可操作的排查建议。
+        V1.1-5 修复：CAD 未启动时 EnsureDispatch 会把它拉起来，但启动期
+        COM 会连着抛 RPC_E_CALL_REJECTED，pywin32 甚至会包成
+            TypeError: This COM object can not automate the makepy process
+        这不是"连不上"，而是"CAD 还在启动"。所以：
+          - 用独立的、更长的超时预算（默认 60s，足够冷启动）；
+          - 重试循环同时捕获 com_error / TypeError / 通用异常；
+          - 每次重试之间等待，让 CAD 完成初始化；
+          - 早绑定持续失败才退回晚绑定 Dispatch，最终再报错。
         """
-        return self._on_com(lambda: self._connect_impl(visible))
+        # 冷启动可能需要几十秒，给这条调用单独的超时预算
+        startup_timeout = max(60.0, (self.timeout_ms / 1000.0) * max(2, self.retry_times))
+        return self._on_com(lambda: self._connect_impl(visible), timeout_s=startup_timeout)
 
     def _connect_impl(self, visible: bool = True) -> dict[str, Any]:
         self._ensure_com()
 
-        # 用 gencache.EnsureDispatch（早绑定）而不是 Dispatch（晚绑定）。
+        # ★ 用 gencache.EnsureDispatch（早绑定）而不是 Dispatch（晚绑定）。
+        # 原因（实测）：早绑定生成强类型包装，SAFEARRAY(double) 能被正确传递；
+        # 晚绑定下即使传 VARIANT(VT_ARRAY|VT_R8) 也偶发 E_INVALIDARG。
+        # EnsureDispatch 会先找已运行实例，找不到再启动 —— 正是"自动唤醒"所需。
         #
-        # 原因（实测）：
-        #   - 早绑定会从 AutoCAD 的 typelib 生成强类型包装，参数类型由 marshaler 保证，
-        #     SAFEARRAY(double) 能被正确传递；
-        #   - 晚绑定下即使传 VARIANT(VT_ARRAY|VT_R8) 也偶发 E_INVALIDARG；
-        #   - 而且早绑定能拿到 AcDbLine 这类常量（acRed 等），代码可读性也更好。
-        #
-        # EnsureDispatch 会先找已运行的实例，找不到再启动一个 —— 正是我们要的行为。
-        # 首次调用会生成 gen_py 缓存（约 1~3 秒），后续走缓存很快。
-        try:
+        # V1.1-5：启动期 CAD 尚未就绪时，EnsureDispatch 内部 makepy 会抛
+        #   com_error(RPC_E_CALL_REJECTED) 或 TypeError(can not automate makepy)
+        # 所以这里做有界重试，直到拿到可用 Application 或超时。
+        app = None
+        last_exc: Exception | None = None
+        deadline = time.monotonic() + 55.0
+        attempt = 0
+        while time.monotonic() < deadline:
+            attempt += 1
             try:
                 app = gencache.EnsureDispatch(self.prog_id, bForDemand=False)
-            except Exception:
-                # gen_py 生成失败（权限/typelib 损坏）时退回晚绑定，
-                # 晚绑定下 VARIANT(VT_ARRAY) 仍能工作，只是不那么稳。
+                # 拿到对象不等于就绪：Version 在启动期也可能被拒，主动探一次
+                _ = str(app.Version)
+                break
+            except pywintypes.com_error as exc:
+                last_exc = exc
+                hr = _hresult(exc)
+                if hr not in BUSY_HRESULTS:
+                    # 非"忙碌"类错误（如 ProgID 不存在）没必要死等
+                    break
+                app = None
+                time.sleep(0.8)
+            except Exception as exc:  # noqa: BLE001  TypeError 等启动期包装异常
+                last_exc = exc
+                app = None
+                time.sleep(0.8)
+
+        if app is None:
+            # 早绑定始终失败 → 退回避重连的晚绑定，再不行才报错
+            try:
                 app = win32com.client.Dispatch(self.prog_id)
-        except pywintypes.com_error as exc:
+                _ = str(app.Version)
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                app = None
+
+        if app is None:
             raise CadDisconnectedError(
-                f"无法连接 AutoCAD（ProgID='{self.prog_id}'）。\n"
-                f"原始错误：{exc}\n"
+                f"无法连接 AutoCAD（ProgID='{self.prog_id}'，重试 {attempt} 次）。\n"
+                f"原始错误：{last_exc}\n"
                 "排查顺序：\n"
-                "  1) AutoCAD 是否已启动并处于登录完成状态（不要停在启动画面）；\n"
+                "  1) AutoCAD 是否已完成启动（不要停在启动画面/许可弹窗）；\n"
                 "  2) ProgID 是否与版本匹配：2024→AutoCAD.Application.24，2023→.23；\n"
                 "  3) 是否以管理员权限运行过 CAD（高权限进程无法被低权限进程 COM 连接）；\n"
                 f"  4) 可用 ProgID 探测：{self.list_available_prog_ids()}"
-            ) from exc
+            )
 
         self._app = app
         version = self._safe(lambda: str(app.Version), default="unknown")
@@ -327,9 +471,18 @@ class CadBridge:
 
             self._safe(_show)
 
-        # 没有打开任何图纸时，AutoCAD 的 Documents 是空的，新建一个空 DWG 便于操作
+        # 没有打开任何图纸时，Documents 是空的，新建一个空 DWG 便于操作。
+        # V1.1-5：Documents.Add() 非幂等（忙时报错但图已建好），按 Count 核对重试。
         if self._safe(lambda: int(app.Documents.Count), default=0) == 0:
-            self._safe(lambda: app.Documents.Add())
+            doc_deadline = time.monotonic() + 20.0
+            while time.monotonic() < doc_deadline:
+                try:
+                    app.Documents.Add()
+                except Exception:  # noqa: BLE001  忙也可能已建好，下一轮按 Count 核对
+                    pass
+                if self._safe(lambda: int(app.Documents.Count), default=0) > 0:
+                    break
+                time.sleep(0.6)
 
         return {
             "ok": True,
@@ -369,6 +522,21 @@ class CadBridge:
     def disconnect(self) -> None:
         """只丢引用，不关 CAD —— 关掉用户的 CAD 会让人丢数据。"""
         self._app = None
+
+    def reconnect(self) -> dict[str, Any]:
+        """
+        V1.1-5「超时重连」：队列卡死 / COM 断开后重建 worker + 重连 CAD。
+
+        不主动关闭用户的 AutoCAD，只丢弃旧 COM 引用与可能卡死的专用线程，
+        再走一次 connect()。这样 modal 弹窗关掉后无需重启整个 MCP 进程。
+        """
+        old_worker = self._worker
+        self._app = None
+        self._com_ready = False
+        self._com_threads.clear()
+        self._worker = _ComWorker()
+        old_worker.abandon()
+        return self.connect()
 
     # -- 低层调用：忙检测 + 重试 -------------------------------------------
 
@@ -529,6 +697,8 @@ class CadBridge:
             "active_document": doc_name,
             "document_count": doc_count,
             "prog_id": self.prog_id,
+            "default_layer": self.default_layer or None,
+            "queue": self._worker.health(),
         }
 
     def is_busy(self) -> bool:
@@ -563,16 +733,23 @@ class CadBridge:
             "note": "SendCommand 为异步发送，不等待执行完成",
         }
 
-    def send_escape(self) -> dict[str, Any]:
+    def send_escape(self, doc_name: str | None = None) -> dict[str, Any]:
         """
         发送 ESC 以解除 CAD 卡住的状态（关闭弹窗 / 取消当前命令）。
 
-        实现在"前端/插件层"通常靠 SendKeys，这里用 COM 的 PostCommand 发 ESC。
+        ★ 实测：PostCommand 是 IAcadDocument 的方法，不是 IAcadApplication 的
+        （早绑定下 app.PostCommand 会报 "object has no attribute 'PostCommand'"）。
+        且 ESC 必须用 PostCommand 排队，用 SendCommand 发 "\x1b" 会报「输入无效」。
         注意：PostCommand 只在空闲时可排队；忙时它本身会失败，属预期。
         """
+        def _do():
+            doc = self._document(doc_name)
+            doc.PostCommand("\x1b\x1b")
+            return True
+
         try:
-            self._call("发送 ESC", lambda: self._app.PostCommand("\x1b\x1b"))
-            return {"ok": True, "note": "已通过 PostCommand 排队发送 ESC"}
+            self._call("发送 ESC", _do)
+            return {"ok": True, "note": "已通过文档 PostCommand 排队发送 ESC"}
         except CadError as exc:
             return {
                 "ok": False,
@@ -588,6 +765,9 @@ class CadBridge:
         if not name or not name.strip():
             raise CadError("图层名不能为空。")
         color_index = self._resolve_color(color)
+        spec = GB_LAYERS.get(name)
+        lw = spec["lineweight"] if spec else None
+        lt = spec["linetype"] if spec else None
 
         def _do():
             doc = self._document(doc_name)
@@ -605,6 +785,25 @@ class CadBridge:
                 created = False
             if color_index is not None:
                 layer.color = color_index
+            elif spec is not None:
+                layer.color = spec["color"]
+            # V1.1-2：标准图层自动带线宽/线型（动态 Dispatch 兜住 narrow 化）
+            if lw is not None or lt:
+                d = dynamic.Dispatch(layer)
+                if lw is not None:
+                    try:
+                        d.Lineweight = lw
+                    except Exception:
+                        pass
+                if lt:
+                    try:
+                        doc.Linetypes.Load(lt, "acad.lin")
+                    except Exception:
+                        pass  # 已加载 / 线型文件缺失时忽略
+                    try:
+                        d.Linetype = lt
+                    except Exception:
+                        pass
             return created
 
         created = self._call(f"创建/复用图层 {name}", _do)
@@ -615,6 +814,22 @@ class CadBridge:
             "color_index": color_index,
             "document": self._last_doc_name,
         }
+
+    def _layer_for(self, layer: str | None, kind: str | None = None) -> str | None:
+        """
+        V1.1-2 自动归属，优先级：显式 layer > 配置 default_layer > 按大类。
+
+        「按大类」只在 auto_layer_by_kind=True 时生效（由
+        setup_mechanical_environment() 打开）。默认关闭是刻意的向下兼容：
+        老行为是「省略 layer 就用 CAD 当前图层」，不能悄悄改掉。
+        """
+        if layer:
+            return layer
+        if self.default_layer:
+            return self.default_layer
+        if self.auto_layer_by_kind and kind:
+            return DEFAULT_LAYER_BY_KIND.get(kind)
+        return None
 
     @staticmethod
     def _resolve_color(color: str | int | None) -> int | None:
@@ -653,6 +868,7 @@ class CadBridge:
     ) -> dict[str, Any]:
         if len(start) < 2 or len(end) < 2:
             raise CadError("add_line 需要两个二维或三维坐标点。")
+        layer = self._layer_for(layer, "outline")
         if layer:
             self.ensure_layer(layer, doc_name=doc_name)
 
@@ -677,6 +893,7 @@ class CadBridge:
             raise CadError("add_circle 需要圆心坐标。")
         if radius <= 0:
             raise CadError("半径必须大于 0。")
+        layer = self._layer_for(layer, "outline")
         if layer:
             self.ensure_layer(layer, doc_name=doc_name)
 
@@ -700,6 +917,7 @@ class CadBridge:
         """用 LightWeightPolyline 画矩形（4 个顶点闭合）。"""
         x1, y1 = float(corner1[0]), float(corner1[1])
         x2, y2 = float(corner2[0]), float(corner2[1])
+        layer = self._layer_for(layer, "outline")
         if layer:
             self.ensure_layer(layer, doc_name=doc_name)
 
@@ -737,6 +955,7 @@ class CadBridge:
         flat: list[float] = []
         for p in pts:
             flat.extend([float(p[0]), float(p[1])])
+        layer = self._layer_for(layer, "outline")
         if layer:
             self.ensure_layer(layer, doc_name=doc_name)
 
@@ -761,6 +980,7 @@ class CadBridge:
     ) -> dict[str, Any]:
         if len(position) < 2:
             raise CadError("add_text 需要插入点坐标。")
+        layer = self._layer_for(layer, "text")
         if layer:
             self.ensure_layer(layer, doc_name=doc_name)
 
@@ -783,6 +1003,7 @@ class CadBridge:
         layer: str | None = None,
         doc_name: str | None = None,
     ) -> dict[str, Any]:
+        layer = self._layer_for(layer, "outline")
         if layer:
             self.ensure_layer(layer, doc_name=doc_name)
 
@@ -800,6 +1021,681 @@ class CadBridge:
 
         info = self._call("画圆弧", _do)
         return {"ok": True, "type": "arc", "center": list(center), "radius": float(radius), "start_deg": start_angle_deg, "end_deg": end_angle_deg, "layer": layer, **info, "document": self._last_doc_name}
+
+    # -----------------------------------------------------------------------
+    # V1.1-1 完整尺寸标注体系
+    #
+    # 全部经 probe_v11.py / probe_v11b.py / probe_v11c.py 在 AutoCAD 2024 实测：
+    #   - 角度一律是【弧度】（AddDimRotated 第 4 参数、InsertBlock 旋转角）
+    #   - 坐标一律 VARIANT(VT_ARRAY|VT_R8)
+    #   - 标注样式变量必须「先建并激活 DimStyle → 再 SetVariable → CopyFrom 固化」
+    #     否则变量会落到旧样式上（probe_v11b 序列 B 读回 0.18/Standard）
+    #   - 读属性/读文字一律 dynamic.Dispatch（gen_py 会窄化成 IAcadEntity）
+    # -----------------------------------------------------------------------
+
+    def _finish_dim(self, ent: Any, layer: str | None, text_override: str | None) -> dict[str, Any]:
+        """给新建标注统一收尾：归属图层、文字替代、回报测量值。在 COM 线程内调用。"""
+        d = dynamic.Dispatch(ent)
+        if layer:
+            d.Layer = layer
+        if text_override:
+            d.TextOverride = str(text_override)
+        return {
+            "handle": self._safe(lambda: str(ent.Handle), default=""),
+            "object_name": self._safe(lambda: str(ent.ObjectName), default=""),
+            "measurement": self._safe(lambda: round(float(d.Measurement), 6), default=None),
+        }
+
+    def setup_text_style(
+        self,
+        name: str = "DSH-CN",
+        font: str = CN_FONT,
+        bigfont: str = CN_BIGFONT,
+        doc_name: str | None = None,
+    ) -> dict[str, Any]:
+        """建/复用中文工程文字样式（gbenor.shx + gbcbig.shx），否则中文会显示成 ???。"""
+        if not name or not name.strip():
+            raise CadError("文字样式名不能为空。")
+
+        def _do():
+            doc = self._document(doc_name)
+            styles = doc.TextStyles
+            existing = None
+            try:
+                existing = styles.Item(name)
+            except Exception:
+                existing = None
+            created = existing is None
+            style = existing if existing is not None else styles.Add(name)
+            # 早绑定对象没有 fontFile/bigFontFile 属性，必须走动态 Dispatch
+            d = dynamic.Dispatch(style)
+            d.fontFile = font
+            d.bigFontFile = bigfont
+            return {"created": created}
+
+        info = self._call(f"建文字样式 {name}", _do)
+        return {
+            "ok": True, "style": name, "font": font, "bigfont": bigfont,
+            **info, "document": self._last_doc_name,
+        }
+
+    def setup_gb_dim_style(
+        self,
+        text_style: str = "DSH-CN",
+        dim_style: str = "GB-机械",
+        dim_vars: dict[str, Any] | None = None,
+        doc_name: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        建立并激活国标标注样式。
+
+        顺序是实测定稿的（probe_v11b）：
+          建中文文字样式 → 建/激活 DimStyle → 设 DIM* 变量 → DimStyle.CopyFrom(doc)
+        反序会让变量落到旧样式，尺寸文字仍是 0.18 / Standard。
+        """
+        # 文字样式必须先存在，DIMTXSTY 才设得上
+        self.setup_text_style(text_style, doc_name=doc_name)
+        vars_ = dict(GB_DIM_VARS)
+        if dim_vars:
+            vars_.update(dim_vars)
+        vars_["DIMTXSTY"] = text_style
+
+        def _do():
+            doc = self._document(doc_name)
+            styles = doc.DimStyles
+            existing = None
+            try:
+                existing = styles.Item(dim_style)
+            except Exception:
+                existing = None
+            created = existing is None
+            ds = existing if existing is not None else styles.Add(dim_style)
+            # ① 先激活目标样式
+            doc.ActiveDimStyle = ds
+            # ② 再写变量（此时写进的是刚激活的样式）
+            failed = []
+            for key, value in vars_.items():
+                try:
+                    doc.SetVariable(key, value)
+                except Exception:  # noqa: BLE001  个别变量在部分版本不存在
+                    failed.append(key)
+            # ③ 固化到样式记录里，切走再切回也不会丢
+            try:
+                ds.CopyFrom(doc)
+            except Exception as exc:  # noqa: BLE001
+                failed.append(f"CopyFrom:{exc}")
+            return {"created": created, "vars_set": len(vars_), "failed": failed}
+
+        info = self._call(f"建标注样式 {dim_style}", _do)
+        return {
+            "ok": True, "dim_style": dim_style, "text_style": text_style,
+            **info, "document": self._last_doc_name,
+        }
+
+    def add_dim_linear(
+        self,
+        p1: Sequence[float],
+        p2: Sequence[float],
+        dim_line_point: Sequence[float],
+        angle_deg: float = 0.0,
+        text_override: str = "",
+        layer: str | None = None,
+        doc_name: str | None = None,
+    ) -> dict[str, Any]:
+        """线性标注（水平/垂直/倾斜）。angle_deg 是尺寸线角度（度），0=水平、90=竖直。"""
+        layer = self._layer_for(layer, "dim")
+        if layer:
+            self.ensure_layer(layer, doc_name=doc_name)
+
+        def _do():
+            doc = self._document(doc_name)
+            ent = doc.ModelSpace.AddDimRotated(
+                _pt(*p1[:3]), _pt(*p2[:3]), _pt(*dim_line_point[:3]),
+                math.radians(float(angle_deg)),
+            )
+            return self._finish_dim(ent, layer, text_override)
+
+        info = self._call("线性标注", _do)
+        return {"ok": True, "type": "linear", "angle_deg": angle_deg,
+                "layer": layer, **info, "document": self._last_doc_name}
+
+    def add_dim_aligned(
+        self,
+        p1: Sequence[float],
+        p2: Sequence[float],
+        dim_line_point: Sequence[float],
+        text_override: str = "",
+        layer: str | None = None,
+        doc_name: str | None = None,
+    ) -> dict[str, Any]:
+        """对齐标注：尺寸线平行于 p1-p2 连线（用于斜边）。"""
+        layer = self._layer_for(layer, "dim")
+        if layer:
+            self.ensure_layer(layer, doc_name=doc_name)
+
+        def _do():
+            doc = self._document(doc_name)
+            ent = doc.ModelSpace.AddDimAligned(
+                _pt(*p1[:3]), _pt(*p2[:3]), _pt(*dim_line_point[:3]),
+            )
+            return self._finish_dim(ent, layer, text_override)
+
+        info = self._call("对齐标注", _do)
+        return {"ok": True, "type": "aligned", "layer": layer,
+                **info, "document": self._last_doc_name}
+
+    def add_dim_radial(
+        self,
+        center: Sequence[float],
+        chord_point: Sequence[float],
+        leader_length: float = 10.0,
+        text_override: str = "",
+        layer: str | None = None,
+        doc_name: str | None = None,
+    ) -> dict[str, Any]:
+        """半径标注。chord_point 是圆周上的取点，leader_length 是引线长度。"""
+        layer = self._layer_for(layer, "dim")
+        if layer:
+            self.ensure_layer(layer, doc_name=doc_name)
+
+        def _do():
+            doc = self._document(doc_name)
+            ent = doc.ModelSpace.AddDimRadial(
+                _pt(*center[:3]), _pt(*chord_point[:3]), float(leader_length),
+            )
+            return self._finish_dim(ent, layer, text_override)
+
+        info = self._call("半径标注", _do)
+        return {"ok": True, "type": "radial", "layer": layer,
+                **info, "document": self._last_doc_name}
+
+    def add_dim_diametric(
+        self,
+        chord1: Sequence[float],
+        chord2: Sequence[float],
+        leader_length: float = 10.0,
+        text_override: str = "",
+        layer: str | None = None,
+        doc_name: str | None = None,
+    ) -> dict[str, Any]:
+        """直径标注。chord1/chord2 是直径两端点。"""
+        layer = self._layer_for(layer, "dim")
+        if layer:
+            self.ensure_layer(layer, doc_name=doc_name)
+
+        def _do():
+            doc = self._document(doc_name)
+            ent = doc.ModelSpace.AddDimDiametric(
+                _pt(*chord1[:3]), _pt(*chord2[:3]), float(leader_length),
+            )
+            return self._finish_dim(ent, layer, text_override)
+
+        info = self._call("直径标注", _do)
+        return {"ok": True, "type": "diametric", "layer": layer,
+                **info, "document": self._last_doc_name}
+
+    def add_dim_angular(
+        self,
+        vertex: Sequence[float],
+        p1: Sequence[float],
+        p2: Sequence[float],
+        text_point: Sequence[float],
+        text_override: str = "",
+        layer: str | None = None,
+        doc_name: str | None = None,
+    ) -> dict[str, Any]:
+        """角度标注（两条线之间的夹角）。"""
+        layer = self._layer_for(layer, "dim")
+        if layer:
+            self.ensure_layer(layer, doc_name=doc_name)
+
+        def _do():
+            doc = self._document(doc_name)
+            ent = doc.ModelSpace.AddDimAngular(
+                _pt(*vertex[:3]), _pt(*p1[:3]), _pt(*p2[:3]), _pt(*text_point[:3]),
+            )
+            return self._finish_dim(ent, layer, text_override)
+
+        info = self._call("角度标注", _do)
+        return {"ok": True, "type": "angular", "layer": layer,
+                **info, "document": self._last_doc_name}
+
+    def add_dim_ordinate(
+        self,
+        definition_point: Sequence[float],
+        leader_end_point: Sequence[float],
+        use_x_axis: bool = True,
+        text_override: str = "",
+        layer: str | None = None,
+        doc_name: str | None = None,
+    ) -> dict[str, Any]:
+        """坐标标注。use_x_axis=True 标 X 坐标，False 标 Y 坐标。"""
+        layer = self._layer_for(layer, "dim")
+        if layer:
+            self.ensure_layer(layer, doc_name=doc_name)
+
+        def _do():
+            doc = self._document(doc_name)
+            ent = doc.ModelSpace.AddDimOrdinate(
+                _pt(*definition_point[:3]), _pt(*leader_end_point[:3]), bool(use_x_axis),
+            )
+            return self._finish_dim(ent, layer, text_override)
+
+        info = self._call("坐标标注", _do)
+        return {"ok": True, "type": "ordinate", "use_x_axis": bool(use_x_axis),
+                "layer": layer, **info, "document": self._last_doc_name}
+
+    # -----------------------------------------------------------------------
+    # V1.1-2 机械标准图层自动化
+    # -----------------------------------------------------------------------
+
+    def setup_standard_layers(self, doc_name: str | None = None) -> dict[str, Any]:
+        """一次性建好 GB_LAYERS 里全部机械标准图层（含颜色/线宽/线型）。幂等。"""
+        created = []
+        for name, spec in GB_LAYERS.items():
+            self.ensure_layer(name, color=spec["color"], doc_name=doc_name)
+            created.append(name)
+        return {"ok": True, "layers": created, "count": len(created),
+                "document": self._last_doc_name}
+
+    def set_layer_state(
+        self,
+        name: str,
+        lock: bool | None = None,
+        freeze: bool | None = None,
+        layer_on: bool | None = None,
+        color: str | int | None = None,
+        lineweight: int | None = None,
+        active: bool = False,
+        doc_name: str | None = None,
+    ) -> dict[str, Any]:
+        """批量改图层状态：锁定/冻结/开关/颜色/线宽/设为当前层。"""
+        color_index = self._resolve_color(color) if color is not None else None
+
+        def _do():
+            doc = self._document(doc_name)
+            try:
+                lay = doc.Layers.Item(name)
+            except Exception as exc:  # noqa: BLE001
+                raise CadError(f"找不到图层 '{name}'：{exc}") from exc
+            d = dynamic.Dispatch(lay)
+            applied: dict[str, Any] = {}
+            failed: dict[str, str] = {}
+
+            def _set(key, prop, value):
+                try:
+                    setattr(d, prop, value)
+                    applied[key] = value
+                except Exception as exc:  # noqa: BLE001
+                    failed[key] = str(exc)
+
+            if lock is not None:
+                _set("lock", "Lock", bool(lock))
+            if freeze is not None:
+                _set("freeze", "Freeze", bool(freeze))
+            if layer_on is not None:
+                _set("layer_on", "LayerOn", bool(layer_on))
+            if color_index is not None:
+                _set("color", "color", color_index)
+            if lineweight is not None:
+                _set("lineweight", "Lineweight", int(lineweight))
+            if active:
+                try:
+                    doc.ActiveLayer = lay
+                    applied["active"] = True
+                except Exception as exc:  # noqa: BLE001  当前层不能冻结/关闭
+                    failed["active"] = str(exc)
+            return {"applied": applied, "failed": failed}
+
+        info = self._call(f"设置图层状态 {name}", _do)
+        return {"ok": True, "layer": name, **info, "document": self._last_doc_name}
+
+    def set_active_layer(self, name: str, doc_name: str | None = None) -> dict[str, Any]:
+        """把某个图层设为当前层（后续不指定 layer 的图元自动归属到这里）。"""
+        return self.set_layer_state(name, active=True, doc_name=doc_name)
+
+    def setup_mechanical_environment(self, doc_name: str | None = None) -> dict[str, Any]:
+        """
+        V1.1 交付标准「一句话完成分层规范」：一次调用建好全部标准图层 +
+        中文文字样式 + 国标标注样式 + 常用文档变量（mm / 线宽显示 / 关联标注）。
+        """
+        layers = self.setup_standard_layers(doc_name)
+        text = self.setup_text_style(doc_name=doc_name)
+        dim = self.setup_gb_dim_style(doc_name=doc_name)
+
+        def _do():
+            doc = self._document(doc_name)
+            for key, value in {
+                "INSUNITS": 4,      # 毫米
+                "LWDISPLAY": 1,     # 显示线宽
+                "MEASUREMENT": 1,   # 公制
+                "DIMASSOC": 2,      # 关联标注
+                "LTSCALE": 1.0,
+            }.items():
+                try:
+                    doc.SetVariable(key, value)
+                except Exception:  # noqa: BLE001
+                    pass
+            return True
+
+        self._call("设置文档变量", _do)
+        # 交付标准「自动分层规范」：环境建好后，后续省略 layer 的调用按大类自动归属。
+        self.auto_layer_by_kind = True
+        return {
+            "ok": True,
+            "layers": layers["layers"],
+            "text_style": text["style"],
+            "dim_style": dim["dim_style"],
+            "auto_layer_by_kind": True,
+            "document": self._last_doc_name,
+        }
+
+    # -----------------------------------------------------------------------
+    # V1.1-3 块与属性块
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _find_by_handle(doc: Any, handle: str) -> Any | None:
+        """在模型空间按句柄找图元；返回 dynamic.Dispatch 包装（避免 IAcadEntity 窄化）。"""
+        for i in range(int(doc.ModelSpace.Count)):
+            ent = doc.ModelSpace.Item(i)
+            try:
+                if str(ent.Handle) == handle:
+                    return dynamic.Dispatch(ent)
+            except Exception:
+                continue
+        return None
+
+    def list_blocks(self, doc_name: str | None = None) -> dict[str, Any]:
+        """列出图纸中已定义的块名（过滤掉 *Model_Space / *Paper_Space 内建块）。"""
+
+        def _do():
+            doc = self._document(doc_name)
+            out = []
+            for i in range(int(doc.Blocks.Count)):
+                blk = doc.Blocks.Item(i)
+                name = self._safe(lambda b=blk: str(b.Name), default="")
+                if name and not name.startswith("*"):
+                    out.append(name)
+            return {"count": len(out), "blocks": out}
+
+        result = self._call("读取块定义列表", _do)
+        return {"ok": True, **result, "document": self._last_doc_name}
+
+    def create_block(
+        self,
+        name: str,
+        base_point: Sequence[float] = (0.0, 0.0),
+        entities: list[dict[str, Any]] | None = None,
+        attributes: list[dict[str, Any]] | None = None,
+        doc_name: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        新建块定义。entities 支持 line/circle/arc/text/polyline；
+        attributes 是 [{"tag","value","prompt","height","position","mode"}]。
+        已存在则直接返回（幂等，不覆盖用户已有块）。
+        """
+        if not name or not name.strip():
+            raise CadError("块名不能为空。")
+        ents = list(entities or [])
+        attrs = list(attributes or [])
+
+        def _do():
+            doc = self._document(doc_name)
+            try:
+                doc.Blocks.Item(name)
+                return {"created": False, "reason": "块已存在，未改动"}
+            except Exception:
+                pass
+            blk = doc.Blocks.Add(_pt(*base_point[:3]), str(name))
+            added: list[str] = []
+            for e in ents:
+                kind = str(e.get("type", "")).strip().lower()
+                if kind == "line":
+                    blk.AddLine(_pt(*e["start"][:3]), _pt(*e["end"][:3]))
+                elif kind == "circle":
+                    blk.AddCircle(_pt(*e["center"][:3]), float(e["radius"]))
+                elif kind == "arc":
+                    blk.AddArc(
+                        _pt(*e["center"][:3]), float(e["radius"]),
+                        math.radians(float(e["start_angle_deg"])),
+                        math.radians(float(e["end_angle_deg"])),
+                    )
+                elif kind == "text":
+                    blk.AddText(str(e["text"]), _pt(*e["position"][:3]),
+                                float(e.get("height", 2.5)))
+                elif kind == "polyline":
+                    flat: list[float] = []
+                    for p in e["points"]:
+                        flat.extend([float(p[0]), float(p[1])])
+                    pl = blk.AddLightWeightPolyline(_flat(flat))
+                    pl.Closed = bool(e.get("closed", False))
+                else:
+                    continue
+                added.append(kind)
+            for a in attrs:
+                blk.AddAttribute(
+                    float(a.get("height", 2.5)),
+                    int(a.get("mode", 0)),
+                    str(a.get("prompt", "")),
+                    _pt(*a["position"][:3]),
+                    str(a["tag"]),
+                    str(a.get("value", "")),
+                )
+            return {"created": True, "entities_added": added, "attributes_added": len(attrs)}
+
+        info = self._call(f"新建块 {name}", _do)
+        return {"ok": True, "block": name, **info, "document": self._last_doc_name}
+
+    def insert_block(
+        self,
+        name: str,
+        position: Sequence[float],
+        xscale: float = 1.0,
+        yscale: float = 1.0,
+        zscale: float = 1.0,
+        rotation_deg: float = 0.0,
+        attributes: dict[str, str] | None = None,
+        layer: str | None = None,
+        doc_name: str | None = None,
+    ) -> dict[str, Any]:
+        """把块插入模型空间，并可按 tag 覆盖属性值（属性块核心用法）。"""
+        layer = self._layer_for(layer)
+        if layer:
+            self.ensure_layer(layer, doc_name=doc_name)
+        attr_map = {str(k): str(v) for k, v in (attributes or {}).items()}
+
+        def _do():
+            doc = self._document(doc_name)
+            try:
+                doc.Blocks.Item(name)
+            except Exception as exc:  # noqa: BLE001
+                raise CadError(f"块定义 '{name}' 不存在：{exc}") from exc
+            ref = doc.ModelSpace.InsertBlock(
+                _pt(*position[:3]), str(name),
+                float(xscale), float(yscale), float(zscale),
+                math.radians(float(rotation_deg)),
+            )
+            d = dynamic.Dispatch(ref)
+            if layer:
+                d.Layer = layer
+            changed = []
+            if attr_map:
+                for a in d.GetAttributes():
+                    ad = dynamic.Dispatch(a)
+                    tag = str(ad.TagString)
+                    if tag in attr_map:
+                        ad.TextString = attr_map[tag]
+                        changed.append(tag)
+            return {
+                "handle": self._safe(lambda: str(ref.Handle), default=""),
+                "effective_name": self._safe(lambda: str(d.EffectiveName), default=name),
+                "attributes_changed": changed,
+            }
+
+        info = self._call(f"插入块 {name}", _do)
+        return {"ok": True, "block": name, "layer": layer,
+                **info, "document": self._last_doc_name}
+
+    def list_block_attributes(self, handle: str, doc_name: str | None = None) -> dict[str, Any]:
+        """读某个块参照的全部属性 (tag, value)。"""
+
+        def _do():
+            doc = self._document(doc_name)
+            ref = self._find_by_handle(doc, handle)
+            if ref is None:
+                raise CadError(f"找不到句柄 '{handle}' 对应的图元。")
+            out = []
+            for a in ref.GetAttributes():
+                ad = dynamic.Dispatch(a)
+                out.append({
+                    "tag": self._safe(lambda x=ad: str(x.TagString), default=""),
+                    "value": self._safe(lambda x=ad: str(x.TextString), default=""),
+                    "prompt": self._safe(lambda x=ad: str(x.PromptString), default=""),
+                })
+            return {"effective_name": self._safe(lambda: str(ref.EffectiveName), default=""),
+                    "attributes": out, "count": len(out)}
+
+        result = self._call(f"读取块属性 {handle}", _do)
+        return {"ok": True, "handle": handle, **result, "document": self._last_doc_name}
+
+    def set_block_attribute(
+        self,
+        handle: str,
+        tag: str,
+        value: str,
+        doc_name: str | None = None,
+    ) -> dict[str, Any]:
+        """改某个块参照里指定 tag 的属性值。"""
+
+        def _do():
+            doc = self._document(doc_name)
+            ref = self._find_by_handle(doc, handle)
+            if ref is None:
+                raise CadError(f"找不到句柄 '{handle}' 对应的图元。")
+            changed = []
+            for a in ref.GetAttributes():
+                ad = dynamic.Dispatch(a)
+                if str(ad.TagString) == str(tag):
+                    old = self._safe(lambda x=ad: str(x.TextString), default="")
+                    ad.TextString = str(value)
+                    changed.append({"tag": str(tag), "old": old, "new": str(value)})
+            if not changed:
+                raise CadError(f"图元 {handle} 上没有标签 '{tag}' 的属性。")
+            return {"changed": changed}
+
+        info = self._call(f"改块属性 {handle}.{tag}", _do)
+        return {"ok": True, "handle": handle, **info, "document": self._last_doc_name}
+
+    def replace_block(
+        self,
+        old_name: str,
+        new_name: str,
+        doc_name: str | None = None,
+    ) -> dict[str, Any]:
+        """批量替换：把所有 old_name 的块参照换成 new_name，保留插入点/比例/旋转。"""
+
+        def _do():
+            doc = self._document(doc_name)
+            try:
+                doc.Blocks.Item(new_name)
+            except Exception as exc:  # noqa: BLE001
+                raise CadError(f"目标块 '{new_name}' 不存在：{exc}") from exc
+            ms = doc.ModelSpace
+            targets = []
+            for i in range(int(ms.Count)):
+                ent = ms.Item(i)
+                objname = self._safe(lambda e=ent: str(e.ObjectName), default="")
+                if objname != "AcDbBlockReference":
+                    continue
+                r = dynamic.Dispatch(ent)
+                if self._safe(lambda: str(r.EffectiveName), default="") == old_name:
+                    targets.append(r)
+            replaced = 0
+            for r in targets:
+                ins = list(self._safe(lambda: r.InsertionPoint, default=(0.0, 0.0, 0.0)))
+                xs = float(self._safe(lambda: r.XScaleFactor, default=1.0))
+                ys = float(self._safe(lambda: r.YScaleFactor, default=1.0))
+                zs = float(self._safe(lambda: r.ZScaleFactor, default=1.0))
+                rot = float(self._safe(lambda: r.Rotation, default=0.0))
+                r.Delete()
+                ms.InsertBlock(_pt(*ins[:3]), new_name, xs, ys, zs, rot)
+                replaced += 1
+            return {"matched": len(targets), "replaced": replaced}
+
+        info = self._call(f"批量替换块 {old_name}→{new_name}", _do)
+        return {"ok": True, "old_name": old_name, "new_name": new_name,
+                **info, "document": self._last_doc_name}
+
+    # -----------------------------------------------------------------------
+    # V1.1-4 文字 / MText / 公差
+    # -----------------------------------------------------------------------
+
+    def add_mtext(
+        self,
+        text: str,
+        position: Sequence[float],
+        width: float = 100.0,
+        height: float = 3.5,
+        style: str = "",
+        attachment_point: int = 1,
+        layer: str | None = None,
+        doc_name: str | None = None,
+    ) -> dict[str, Any]:
+        """多行文字（MText）。\\P 换行；配合 DSH-CN 样式可写中文技术要求。"""  # noqa: E501
+        layer = self._layer_for(layer, "text")
+        if layer:
+            self.ensure_layer(layer, doc_name=doc_name)
+
+        def _do():
+            doc = self._document(doc_name)
+            ent = doc.ModelSpace.AddMText(_pt(*position[:3]), float(width), str(text))
+            d = dynamic.Dispatch(ent)
+            d.Height = float(height)
+            if attachment_point is not None:
+                d.AttachmentPoint = int(attachment_point)
+            if style:
+                try:
+                    d.StyleName = style
+                except Exception:  # noqa: BLE001  样式不存在时忽略
+                    pass
+            if layer:
+                d.Layer = layer
+            return {"handle": self._safe(lambda: str(ent.Handle), default=""),
+                    "object_name": self._safe(lambda: str(ent.ObjectName), default="")}
+
+        info = self._call("写多行文字", _do)
+        return {"ok": True, "type": "mtext", "text": str(text), "width": float(width),
+                "height": float(height), "style": style, "layer": layer,
+                **info, "document": self._last_doc_name}
+
+    def add_tolerance(
+        self,
+        text: str,
+        position: Sequence[float],
+        direction: Sequence[float] = (1.0, 0.0, 0.0),
+        layer: str | None = None,
+        doc_name: str | None = None,
+    ) -> dict[str, Any]:
+        """形位公差框格（AcDbFcf）。text 用 AutoCAD 控制码，如 %%c40%%p0.01。"""
+        layer = self._layer_for(layer, "dim")
+        if layer:
+            self.ensure_layer(layer, doc_name=doc_name)
+
+        def _do():
+            doc = self._document(doc_name)
+            ent = doc.ModelSpace.AddTolerance(
+                str(text), _pt(*position[:3]), _pt(*direction[:3]),
+            )
+            d = dynamic.Dispatch(ent)
+            if layer:
+                d.Layer = layer
+            return {"handle": self._safe(lambda: str(ent.Handle), default=""),
+                    "object_name": self._safe(lambda: str(ent.ObjectName), default="")}
+
+        info = self._call("写形位公差", _do)
+        return {"ok": True, "type": "tolerance", "text": str(text), "layer": layer,
+                **info, "document": self._last_doc_name}
 
     # -- 读取 --------------------------------------------------------------
 

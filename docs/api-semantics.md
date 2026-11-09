@@ -245,3 +245,81 @@ sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 ## 补充：`PostCommand` 是异步的
 
 `cad_send_command` 返回 `sent: true` 只代表**已发出**，不代表**已执行完**。发完命令后立刻读图元列表，可能读不到刚创建的东西。需要确定性时，用具体的 `Add*` 方法而不是 `SendCommand`。
+
+---
+
+## V1.1 补充：尺寸、块、ESC、冷启动的实测语义
+
+以下都是 V1.1 开发期用 live AutoCAD 2024 逐条验证过的，属于「按直觉写会静默出错」的类型。
+
+### 国标标注样式的变量顺序（顺序错了会静默失效）
+
+`DIM*` 变量是**按当前活动 DimStyle 存储**的。若先 `SetVariable` 再切 `ActiveDimStyle`，设置会落在旧样式上，读回 `DIMTXT=0.18 / DIMTXSTY=Standard`（而不是你设的 `3.5 / DSH-CN`）。
+
+正确顺序（实测定稿）：
+
+```
+建中文文字样式 → 建并激活 DimStyle → 设 24 个 DIM* 变量
+→ DimStyle.CopyFrom(doc) 固化 → 才画标注
+```
+
+`CopyFrom(doc)` 之后即使切到别的样式再切回，变量仍保留（序列 D 验证）。在这个样式下画 `AddDimRotated`，`TextHeight` 读出 `3.5`、`StyleName` 是自定义样式。
+
+### `PostCommand` 挂在 Document 上，不是 Application 上
+
+1.0.0 的 `cad_escape` 写的是 `app.PostCommand(...)`，实测三种 `IAcadApplication`（早绑定/动态/晚绑定）上 **PostCommand / SendCommand / SendKeys / RunCommand 全都不存在**，报 `AttributeError`。而 `IAcadDocument` 上 `PostCommand` 与 `SendCommand` 都在。
+
+```python
+doc.PostCommand("\x1b\x1b")   # ✓ 排队发 ESC
+app.PostCommand("\x1b\x1b")   # ✗ AttributeError
+```
+
+### ESC 只能用 `PostCommand`，不能用 `SendCommand`
+
+`doc.SendCommand("\x1b\x1b")` 报
+`com_error: (-2147352567, '发生意外。', (0, 'AutoCAD', '输入无效', ...OLE_ERR.CHM, -2145386493, -2145386493), None)`。
+ESC 必须走 `PostCommand` 排队。
+
+### 读块属性要 `dynamic.Dispatch`
+
+`ModelSpace.Item(i)` 枚举取回的实体会被 gen_py 窄化成 `IAcadEntity`，直接
+`ref.GetAttributes()` / `ref.EffectiveName` 会 `AttributeError`。
+
+```python
+d = dynamic.Dispatch(ent)          # 先升级成完整类型
+d.EffectiveName                    # 'V11CBLK'
+for a in d.GetAttributes():        # 再读/写属性
+    dynamic.Dispatch(a).TextString = "B-999"
+```
+
+注意：`InsertBlock` **直接返回**的对象已经是完整的
+`IAcadBlockReference`，上面可以不 `dynamic.Dispatch`；窄化只发生在
+「按索引枚举取回」的路径上。两种路径生产代码都要覆盖。
+
+### 冷启动时 `EnsureDispatch` 会抛 `TypeError`，不只是 `com_error`
+
+CAD 未运行时 COM 会拉起 `acad.exe`，启动期间调用
+`gencache.EnsureDispatch(prog_id, bForDemand=False)` 抛的可能是：
+
+```
+TypeError: This COM object can not automate the makepy process - please run makepy manually for this object
+```
+
+（来自 gencache 的 makepy 流程，伴随 `pywintypes.com_error: (-2147418111, '被呼叫方拒绝接收呼叫。')`）。
+所以连接重试必须同时捕 `com_error` 与 `Exception`，用 deadline 循环等 CAD
+就绪，失败再退回 `Dispatch`。此外 `Documents.Add()` 非幂等（忙时报错但图纸
+已建好），要按 `Documents.Count` 核对而不是无脑重试。
+
+### 6 种标注的 COM 签名（角度一律是弧度）
+
+| 方法 | 关键点 |
+|---|---|
+| `AddDimRotated(p1, p2, linePoint, rotationAngle)` | `rotationAngle` 是弧度；传 `90.0` 会让 Measurement 变垃圾值 |
+| `AddDimAligned(p1, p2, linePoint)` | — |
+| `AddDimRadial(center, chordPoint, leaderLength)` | — |
+| `AddDimDiametric(chord1, chord2, leaderLength)` | — |
+| `AddDimAngular(vertex, firstEnd, secondEnd, textPoint)` | 返回 `AcDb2LineAngularDimension` |
+| `AddDimOrdinate(definitionPoint, leaderEndPoint, useXAxis)` | `useXAxis` 是 bool |
+| `AddTolerance(text, insertionPoint, direction)` | 返回 `AcDbFcf`；`direction` 是点向量 |
+
+`direction` 之类向量参数同样要 `VARIANT(VT_ARRAY|VT_R8)`。

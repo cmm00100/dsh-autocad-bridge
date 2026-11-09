@@ -1,6 +1,10 @@
 # DSH AutoCAD Bridge
 
-把本机 **AutoCAD 2024** 变成 DeepSeek Harness Agent 的一双手：查状态、画图元、管图层、跑原生命令、建 3D 实体，全部通过 MCP 工具调用完成。附带一个可视化的**控制面板**，负责托管后台桥进程的启停、参数、状态灯与实时日志。
+把本机 **AutoCAD 2024** 变成 DeepSeek Harness Agent 的一双手：查状态、画图元、管图层、**国标尺寸标注**、块与属性块、MText/形位公差、跑原生命令、建 3D 实体，全部通过 MCP 工具调用完成。附带一个可视化的**控制面板**，负责托管后台桥进程的启停、参数、状态灯与实时日志。
+
+**当前版本 1.1.0**（V1.1 工业基础能力补全）：39 个工具，一句话即可
+「建好机械制图环境 + 画零件 + 自动标注 + 自动分层」。迭代计划见
+[docs/ROADMAP.md](docs/ROADMAP.md)，改动记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 > English: [README.en.md](README.en.md)
 
@@ -59,13 +63,16 @@ AutoCAD 本身是一个桌面 GUI 程序，没有对外的 HTTP API。想在 Age
 - **依赖自举**：一键在你自己的数据目录建虚拟环境、装 pywin32/mcp/python-dotenv
 - **环境探测**：自动找出 Python 与桥目录，自动检测本机实际注册了哪些 AutoCAD ProgID
 
-### 18 个 Agent 工具
+### 39 个 Agent 工具
+
+#### 基础（V1.0，18 个，全部保留）
 
 | 工具 | 作用 |
 |---|---|
-| `cad_connect` | 连接 AutoCAD（未运行时通过 COM 启动） |
-| `cad_status` | 查状态：`disconnected` / `idle` / `busy` / `error` |
+| `cad_connect` | 连接 AutoCAD（未运行时通过 COM 自动拉起） |
+| `cad_status` | 查状态：`disconnected` / `idle` / `busy` / `error`，含队列健康度 |
 | `cad_escape` | 发 ESC 取消当前命令、关掉模态弹窗（卡死时救命） |
+| `cad_reconnect` | 超时/卡死时重建 COM 连接（V1.1） |
 | `cad_list_progids` | 列出本机注册表中真实存在的 ProgID |
 | `cad_list_documents` | 列出所有打开的 DWG，标出活动文档 |
 | `cad_new_document` | 新建空白图纸（可选 dwt 模板） |
@@ -82,7 +89,47 @@ AutoCAD 本身是一个桌面 GUI 程序，没有对外的 HTTP API。想在 Age
 | `cad_list_entities` | 列出模型空间全部图元（类型/图层/句柄） |
 | `cad_zoom_extents` | 缩放到全图 |
 
-3D 实体（`AddBox` / `AddCylinder` / `Boolean` / `Rotate3D`）目前通过 `cad_send_command` 配合 Python 脚本使用，见 [示例](#示例)。
+#### V1.1 工业基础能力（21 个）
+
+| 分类 | 工具 | 作用 |
+|---|---|---|
+| 标注 | `cad_setup_text_style` | 建中文文字样式（`gbenor.shx` + `gbcbig.shx`） |
+| 标注 | `cad_setup_gb_dim_style` | 国标标注样式（24 个 `DIM*` 变量） |
+| 标注 | `cad_add_dim_linear` | 线性/水平/竖直标注 |
+| 标注 | `cad_add_dim_aligned` | 对齐标注 |
+| 标注 | `cad_add_dim_radial` | 半径标注 |
+| 标注 | `cad_add_dim_diametric` | 直径标注 |
+| 标注 | `cad_add_dim_angular` | 角度标注 |
+| 标注 | `cad_add_dim_ordinate` | 坐标标注 |
+| 图层 | `cad_setup_standard_layers` | 一次性建齐 6 个机械标准图层 |
+| 图层 | `cad_set_layer_state` | 批量改锁定/冻结/颜色/线宽/活动层 |
+| 图层 | `cad_set_active_layer` | 切换当前图层 |
+| 环境 | `cad_setup_mechanical_environment` | **一句话建好整套制图环境** |
+| 块 | `cad_list_blocks` | 列出当前文档的块定义 |
+| 块 | `cad_create_block` | 新建块（含属性定义），幂等不覆盖 |
+| 块 | `cad_insert_block` | 插入块，可覆写属性值、旋转缩放 |
+| 块 | `cad_list_block_attributes` | 读块参照的属性 |
+| 块 | `cad_set_block_attribute` | 改块参照的属性值 |
+| 块 | `cad_replace_block` | 批量替换块参照 |
+| 文字 | `cad_add_mtext` | 多行文字（含堆叠公差） |
+| 文字 | `cad_add_tolerance` | 形位公差框 |
+
+#### 一句话画零件图
+
+```
+cad_setup_mechanical_environment   → 建好图层/字体/GB 标注样式，打开自动分层
+cad_add_rectangle / cad_add_circle → 画轮廓，自动落「轮廓」层
+cad_add_dim_linear / ...          → 加标注，自动落「标注」层
+cad_zoom_extents                  → 缩放全图
+```
+
+角度参数统一用**度**（内部转弧度）。标注自动落到「标注」层并支持
+文字覆盖。自动分层开关默认关闭，只有调过
+`cad_setup_mechanical_environment` 才生效——这是刻意的向下兼容。
+
+3D 实体（`AddBox` / `AddCylinder` / `Boolean` / `Rotate3D`）目前通过
+`cad_send_command` 配合 Python 脚本使用，见 [示例](#示例)。V1.3 计划做
+原生 3D 工具，见 [ROADMAP](docs/ROADMAP.md)。
 
 ---
 
@@ -183,11 +230,17 @@ AutoCAD 版本与 ProgID：
 ## 已知限制
 
 - **只能 Windows**：COM 是 Windows 独有的。
-- **必须先有 AutoCAD 桌面进程**：纯后台静默启动 COM 不稳定，插件默认会带界面拉起。
-- **模态弹窗会锁死 COM**：AutoCAD 弹出对话框时所有调用都会卡住，用 `cad_escape` 尝试解救。
-- **单实例串行**：所有 COM 调用排队经过一个 STA 线程，并发调用不会崩，但也不会更快——AutoCAD 本来就是单线程。
+- **AutoCAD 必须是桌面进程**：桥会通过 COM 自动拉起 `acad.exe`（V1.1 已支持
+  冷启动自动唤醒，实测强杀后约 15 秒恢复），但纯后台静默 COM 仍不稳定，
+  建议让 CAD 开着界面。
+- **模态弹窗会锁死 COM**：AutoCAD 弹出对话框时所有调用都会卡住。用
+  `cad_escape` 发 ESC 解救；`cad_status` 现在能报出队列积压与卡了多久，
+  长期卡死可用 `cad_reconnect` 重建连接。
+- **单实例串行**：所有 COM 调用排队经过一个 STA 线程，并发调用不会崩，但
+  也不会更快——AutoCAD 本来就是单线程。
 - **不做视觉校验**：桥只管把东西画出来。画得对不对、好不好看，得另外看图。
-- **控制面板的像素级渲染未经自动化验证**：功能逻辑有 headless 测试覆盖，但界面外观需要你自己点一下确认（见 [限制](docs/limitations.md)）。
+- **控制面板的像素级渲染未经自动化验证**：功能逻辑有 headless 测试覆盖，
+  但界面外观需要你自己点一下确认（见 [限制](docs/limitations.md)）。
 
 ---
 
