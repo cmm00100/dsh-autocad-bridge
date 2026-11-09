@@ -497,3 +497,82 @@ doc.ActiveViewport = vp            # ← 只改 vp 不赋值回，VIEWDIR 不变
 新建对象还开着通知时 CAD 不派发命令。定稿配方：`_apply_view()` 只做纯 COM
 方向切换，`_view_and_shade()` 把「方向」与「VSCURRENT」各用一次 `_call` 隔离，
 一句话方法 = 建模 `_call` → 再 `_view_and_shade`。
+
+---
+
+## V2.0 补充：合规自检 / 企业 .dwt / 图元反解析 / 工程日志 的实测语义
+
+以下结论全部来自 live AutoCAD 2024 实测（probe_v20 / probe_v20b / probe_v20c /
+probe_v20d 四轮），不是文档推断。
+
+### 1. 图元属性走 attribute 访问，不是 getter 方法
+
+`dynamic.Dispatch(doc.ModelSpace.Item(i))` 后按属性名直接读：
+`ObjectName` / `Layer` / `Handle` / `StartPoint` / `EndPoint` / `Length` /
+`Closed` / `Coordinates` / `ConstantWidth` / `Center` / `Radius` /
+`StartAngle` / `EndAngle` / `TextString` / `Height` / `StyleName` /
+`InsertionPoint` / `Measurement` / `TextOverride` / `EffectiveName` /
+`Rotation` / `XScaleFactor`。gen_py 里 grep `def get_*` 只命中表格单元格的
+`SetRotation` → 其余属性都是 dispid 映射，没有 getter 方法。
+
+**窄化陷阱（与 V1.1 同类）**：`ms.Item(i)` 直接取回的对象被 gen_py 收窄成
+`IAcadEntity` 基类 —— `ObjectName` 能读，但 `StartPoint` 报 `<missing>`；
+必须先 `dynamic.Dispatch(...)` 再读全部属性。读块属性同样要
+`dynamic.Dispatch(ref).GetAttributes()`。
+
+### 2. 集合枚举 + 全表扫描要整体塞进一个 `_call` 的 `_do()`
+
+合规自检 / 反解析需要连续读 `Layers` / `TextStyles` / `DimStyles` /
+`Linetypes` 集合的 `.Name` 和一堆 `doc.GetVariable(...)`。零散发调用时 CAD
+后台会忙：`com_error: (-2147418111, '被呼叫方拒绝接收呼叫。', None, None)`，
+甚至 `TextStyles.Item(i).Name` 报 `AttributeError: <unknown>.Name`。
+
+定稿配方：把集合枚举 + `GetVariable` + 全表实体扫描**整体放进一个 `_call`
+的 `_do()` 闭包**（`_call` 自带 BUSY_HRESULTS 重试）。集合 RAW `.Name` 与
+`dynamic` 包装都能读，加了重试后 18/18 全通过。
+
+### 3. 模板目录必须运行时解析，`TEMPLATEPATH` 不可读
+
+- `app.Preferences.Files.TemplatePath` / `TemplateDwtPath` → **不存在**
+  （`AttributeError`），`QNewTemplateFile` 可读但为空。
+- `GetVariable("LOCALROOTPREFIX")` = `C:\Users\...\AppData\Local\Autodesk\AutoCAD 2024\R24.3\chs\`
+  → **模板目录 = `LOCALROOTPREFIX + "Template"`**（回退
+  `ROAMABLEROOTPREFIX`），不写死用户名。
+- `GetVariable("TEMPLATEPATH")` →
+  `com_error: (-2147352567, '发生意外。', (0, 'AutoCAD', '获取系统变量时出错', ...OLE_ERR.CHM, -2145320859, -2145320859), None)`
+  —— 与 VSCURRENT 同类，本版本不可读。
+
+### 4. 不存在的 .dwt 路径会「静默成功」（必须显式校验）
+
+`app.Documents.Add(r"C:\__no_such_dwt__\nope.dwt")` **不报错**，而是悄悄建出
+一张普通新图（没有企业规范）。生产代码 `load_template` 因此先
+`os.path.isfile(path)` 校验，缺文件直接抛 `CadError` 显式拒绝。
+`Documents.Add(dwt)` 还要按 `Documents.Count` 前后核对（非幂等，见 V1.0 结论）。
+
+### 5. 建 .dwt 用 `SaveAs(path, 14)`，并清锁文件
+
+`14 = ac2000_dwt`。实测：在模板里加自定义图层「企业-轮廓」(color=1,
+Lineweight=50)、文字样式「企业-中文」(gbenor.shx/gbcbig.shx)、`INSUNITS=4`
+→ `SaveAs(CUSTOM_DWT, 14)` 得到 99637 B → `Documents.Add(CUSTOM_DWT)` 新图里
+图层 / 文字样式 / INSUNITS 全部存活 → **企业规范确实随模板持久化**。
+`SaveAs` 前先删 `target + ".dwl"` / `".dwl2"` 锁文件，否则报 `-2145320861`。
+
+### 6. `Documents.Add(dwt)` 之后 CAD 会短暂 BUSY（V2.0 真实缺陷）
+
+合规自检 / 反解析 / 读规范在 `Documents.Add` 之后立刻枚举集合时，偶发
+`standard.layers=[]` / `INSUNITS=None`，因为 BUSY 被 `except: pass` 吞掉了。
+
+**定稿配方**：`_read_drawing_standard` 拆成「10 次重试 wrapper」+「单次读取
+`_read_drawing_standard_once`」；单次读取里 BUSY com_error **原样 raise**，
+wrapper 捕到 BUSY 就 `sleep(0.4)` 重试；完备性判据 =
+`result["layers"] and result["sysvars"].get("INSUNITS") is not None`；10 次仍
+不完整则标 `_incomplete=True`。**绝不能把 BUSY 抛回 `_call`** —— 那会让整个
+`_do()` 重跑，触发非幂等的 `Documents.Add` 重复建图。修后连跑 3 次 28/28 全绿。
+
+### 7. 工程日志埋在 `_call` 单点，覆盖全部工具
+
+`_call` 是所有 COM 操作的唯一通道。给它加 `try/except/finally` 记录
+`{seq, action, ok, error, ts, time, duration_ms, thread}` 到环形缓冲
+（`ACTIVITY_LOG_CAPACITY=2000`），即自动覆盖现有 79 个工具与未来新增工具，
+无需逐工具改代码。`cad_get_activity_log` / `cad_export_activity_report`
+刻意走 `bridge()` 而非 `_ensure_connected()` —— 读日志不该把 CAD 拉起来。

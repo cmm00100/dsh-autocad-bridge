@@ -82,7 +82,7 @@ def _fail(exc: Exception, action: str) -> dict[str, Any]:
 mcp = MCPServer(
     name="autocad",
     title="AutoCAD 2024 Bridge",
-    description="通过原生 COM 操控本机 AutoCAD 2024：绘图图元、机械标准图层自动化、国标尺寸标注体系、块与属性块、文字/MText/形位公差、中心线/镜像/偏移/阵列/修剪、外部参照、自动 BOM 明细表、批量 DXF/DWG/PDF 导出、3D 实体建模与 2D→3D 推理、3D 视图切换，命令发送、读取图元、保存 DWG。",
+    description="通过原生 COM 操控本机 AutoCAD 2024：绘图图元、机械标准图层自动化、国标尺寸标注体系、块与属性块、文字/MText/形位公差、中心线/镜像/偏移/阵列/修剪、外部参照、自动 BOM 明细表、批量 DXF/DWG/PDF 导出、3D 实体建模与 2D→3D 推理、3D 视图切换，图纸合规自检、企业 .dwt 模板、DWG 图元数据反解析、工程活动日志与工作报告，命令发送、读取图元、保存 DWG。",
     instructions=(
         "这是连接本机 AutoCAD 2024 的桥。首次调用任何绘图工具时会自动连接（或启动）AutoCAD。\n"
         "约定：\n"
@@ -103,6 +103,16 @@ mcp = MCPServer(
         "- 3D 实体参数的角度都用度（COM 内部是弧度）；Boolean 交集为空时双方会被删除。\n"
         "- AutoCAD 同一时刻只能执行一条命令，遇忙会自动重试；仍失败请让用户在 CAD 里按 ESC 关闭弹窗，\n"
         "  或调用 cad_reconnect 重建 COM 连接。\n"
+        "- 图纸合规自检：cad_check_drawing_compliance 检查图层错误/标注不规范/未闭合轮廓/重复线/碎线，\n"
+        "  返回结构化问题清单且**不改图纸**。\n"
+        "- 企业模板：cad_list_templates 列本机 .dwt、cad_save_as_template 保存当前图为模板、\n"
+        "  cad_load_template 加载模板开新图、cad_read_drawing_standard 读取当前文档制图规范。\n"
+        "  注意：加载不存在的模板路径会抛错（AutoCAD 原生会静默建普通新图，此处已显式拒绝）。\n"
+        "- 图元数据反解析（读 DWG 参数，非视觉识图）：cad_reverse_engineer_drawing 返回图元清单+可复刻脚本，\n"
+        "  cad_export_reverse_script 把复刻脚本写到本地文件，实现「改图/复刻/迭代」闭环。\n"
+        "- 工程日志：所有 COM 操作自动记入活动日志；cad_get_activity_log 查询、\n"
+        "  cad_export_activity_report 导出 Markdown 工作报告（含失败明细，可精准定位出错步骤）。\n"
+        "  日志是纯内存状态，CAD 关掉也能查；不联网、不上传任何图纸数据。\n"
         "- send_command 是异步发送，返回 sent=true 只代表已发出，不代表已执行完。\n"
         "- 有多个 DWG 打开时，用 doc_name 指定目标文档，否则操作当前活动文档。"
     ),
@@ -734,6 +744,85 @@ def cad_profile_to_3d(points: list[list[float]], thickness: float = 10.0, shade:
         return _ensure_connected().profile_to_3d(points, thickness, shade, layer or None, doc_name or None)
     except Exception as exc:  # noqa: BLE001
         return _fail(exc, "cad_profile_to_3d")
+
+
+# ---------------------------------------------------------------------------
+# V2.0 正式工业版工具
+#   ① 图纸合规自检  ② 企业 .dwt 模板  ③ 图元数据反解析  ④ 工程活动日志
+# ---------------------------------------------------------------------------
+
+@mcp.tool(name="cad_check_drawing_compliance", description="图纸合规自检：检查图层错误/标注不规范/未闭合轮廓/重复线/碎线，返回结构化问题清单（不改图纸）。")
+def cad_check_drawing_compliance(doc_name: str = "", min_line_length: float = 1.0, dim_layer: str = "标注", text_layer: str = "文字", gb_dim_style: str = "GB-机械") -> dict[str, Any]:
+    try:
+        return _ensure_connected().check_drawing_compliance(doc_name or None, min_line_length, dim_layer, text_layer, gb_dim_style)
+    except Exception as exc:  # noqa: BLE001
+        return _fail(exc, "cad_check_drawing_compliance")
+
+
+@mcp.tool(name="cad_reverse_engineer_drawing", description="图元数据反解析（非视觉识图）：读现有 DWG 图元参数 → 图元清单 + 统计 + 可复刻的 Python 参数脚本。")
+def cad_reverse_engineer_drawing(doc_name: str = "", limit: int = 5000, include_script: bool = True) -> dict[str, Any]:
+    try:
+        return _ensure_connected().reverse_engineer_drawing(doc_name or None, limit, include_script)
+    except Exception as exc:  # noqa: BLE001
+        return _fail(exc, "cad_reverse_engineer_drawing")
+
+
+@mcp.tool(name="cad_export_reverse_script", description="把图元反解析得到的可复刻参数脚本写到本地文件（离线，不上传）。")
+def cad_export_reverse_script(path: str, doc_name: str = "", limit: int = 5000) -> dict[str, Any]:
+    try:
+        return _ensure_connected().export_reverse_script(path, doc_name or None, limit)
+    except Exception as exc:  # noqa: BLE001
+        return _fail(exc, "cad_export_reverse_script")
+
+
+@mcp.tool(name="cad_list_templates", description="列出本机可用的 .dwt 企业模板（运行时解析 AutoCAD 模板目录）。")
+def cad_list_templates(doc_name: str = "") -> dict[str, Any]:
+    try:
+        return _ensure_connected().list_templates(doc_name or None)
+    except Exception as exc:  # noqa: BLE001
+        return _fail(exc, "cad_list_templates")
+
+
+@mcp.tool(name="cad_read_drawing_standard", description="读取当前文档的制图规范：图层/文字样式/标注样式/系统变量/激活项。")
+def cad_read_drawing_standard(doc_name: str = "") -> dict[str, Any]:
+    try:
+        return _ensure_connected().read_drawing_standard(doc_name or None)
+    except Exception as exc:  # noqa: BLE001
+        return _fail(exc, "cad_read_drawing_standard")
+
+
+@mcp.tool(name="cad_load_template", description="加载企业 .dwt 模板开新图。可传绝对路径或模板目录里的文件名；不存在的路径会显式报错（AutoCAD 原生会静默建普通新图）。")
+def cad_load_template(path: str, doc_name: str = "") -> dict[str, Any]:
+    try:
+        return _ensure_connected().load_template(path, doc_name or None)
+    except Exception as exc:  # noqa: BLE001
+        return _fail(exc, "cad_load_template")
+
+
+@mcp.tool(name="cad_save_as_template", description="把当前文档另存为企业 .dwt 模板（自定义图层/文字样式/INSUNITS 会随模板存活）。")
+def cad_save_as_template(path: str, doc_name: str = "") -> dict[str, Any]:
+    try:
+        return _ensure_connected().save_as_template(path, doc_name or None)
+    except Exception as exc:  # noqa: BLE001
+        return _fail(exc, "cad_save_as_template")
+
+
+@mcp.tool(name="cad_get_activity_log", description="查询工程活动日志（所有 COM 操作自动记录；纯内存状态，CAD 关掉也能查）。可按 action 关键字过滤、按成功/失败过滤。")
+def cad_get_activity_log(limit: int = 100, action: str = "", ok_only: bool | None = None) -> dict[str, Any]:
+    # 注意：这里刻意用 bridge() 而不是 _ensure_connected()——日志与 CAD 是否在跑无关，
+    # 不能为了读日志反而把 CAD 拉起来。
+    try:
+        return bridge().get_activity_log(limit, action, ok_only)
+    except Exception as exc:  # noqa: BLE001
+        return _fail(exc, "cad_get_activity_log")
+
+
+@mcp.tool(name="cad_export_activity_report", description="导出 Markdown 工程工作报告（活动明细 + 失败明细，可精准定位出错步骤）到本地文件。")
+def cad_export_activity_report(path: str = "", doc_name: str = "", limit: int = 2000) -> dict[str, Any]:
+    try:
+        return bridge().export_activity_report(path, doc_name or None, limit)
+    except Exception as exc:  # noqa: BLE001
+        return _fail(exc, "cad_export_activity_report")
 
 
 # ---------------------------------------------------------------------------

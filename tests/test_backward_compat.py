@@ -92,7 +92,13 @@ async def main():
             b = Bridge(session)
 
             names = [t.name for t in (await session.list_tools()).tools]
-            chk("tool count = 70 (all four generations registered)", len(names) == 70, f"got {len(names)}")
+            # V1.0+V1.1+V1.2+V1.3 = 70 tools. 后续版本（V2.0 等）会继续往上加，
+            # 所以这里断言「至少 70 且四代代表工具都在」，而不是锁死一个数字。
+            chk("all four generations registered (>=70 tools)",
+                len(names) >= 70 and all(x in names for x in (
+                    "cad_add_line", "cad_setup_mechanical_environment",
+                    "cad_batch_convert", "cad_dimensions_to_3d")),
+                f"got {len(names)}")
 
             # ------------------------------------------------------------------
             # Phase A: V1.0 baseline. Explicit layer="0" -> deterministic on a

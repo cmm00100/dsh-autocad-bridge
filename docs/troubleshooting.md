@@ -96,6 +96,18 @@ CAD 不派发命令。`cad_dimensions_to_3d` / `cad_profile_to_3d` /
 圆角没生效，先在 CAD 里目视确认命令有没有跑完（必要时按 ESC 结束挂起
 命令），**不要发裸 `VPOINT`**（实测会让 AutoCAD 停在交互提示、COM 全被拒）。
 
+**V2.0 模板 / 反解析场景**：`cad_load_template` / `cad_read_drawing_standard` /
+`cad_check_drawing_compliance` / `cad_reverse_engineer_drawing` 都要连续读集合
+与系统变量。`Documents.Add(dwt)` 之后 AutoCAD 会短暂 BUSY，早期版本会把这段
+BUSY 吞成空规范（偶发 `standard.layers=[]` / `INSUNITS=None`）。当前实现已在
+`_read_drawing_standard` 里做 10 次「只读」重试（完备性判据
+`layers and INSUNITS is not None`），BUSY 只在该层重试、**不抛回 `_call`**
+（否则整个 `_do()` 重跑会重复 `Documents.Add` 建出重复文档）。如果你自己写
+脚本在 `Documents.Add` 之后立刻读规范，等 0.4 秒或加重试即可。
+另一个 V2.0 坑：**不存在的 .dwt 路径不会报错，而是静默建出普通新图**——
+`cad_load_template` 已先 `os.path.isfile` 校验并显式拒绝；若你手发命令加载
+模板，请自己先确认文件存在。
+
 ### 第四步：`尚未调用 CoInitialize`
 
 **这个错不应该再出现。** 如果出现了，说明桥的版本落后——当前实现用单 STA 线程 + 命令队列，所有 COM 调用都在同一个已初始化的线程上。检查 `bridge/cad_com.py` 里有没有 `_ComWorker` 类。

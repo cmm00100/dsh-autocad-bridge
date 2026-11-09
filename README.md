@@ -1,12 +1,14 @@
 # DSH AutoCAD Bridge
 
-把本机 **AutoCAD 2024** 变成 DeepSeek Harness Agent 的一双手：查状态、画图元、管图层、**国标尺寸标注**、块与属性块、MText/形位公差、机械辅助、外部参照、自动 BOM、**批量 DXF/DWG/PDF 交付**、**3D 实体建模与 2D→3D 推理**，全部通过 MCP 工具调用完成。附带一个可视化的**控制面板**，负责托管后台桥进程的启停、参数、状态灯与实时日志。
+把本机 **AutoCAD 2024** 变成 DeepSeek Harness Agent 的一双手：查状态、画图元、管图层、**国标尺寸标注**、块与属性块、MText/形位公差、机械辅助、外部参照、自动 BOM、**批量 DXF/DWG/PDF 交付**、**3D 实体建模与 2D→3D 推理**、**图纸合规自检**、**企业 .dwt 模板**、**DWG 图元数据反解析**、**工程活动日志与工作报告**，全部通过 MCP 工具调用完成。附带一个可视化的**控制面板**，负责托管后台桥进程的启停、参数、状态灯与实时日志。
 
-**当前版本 1.3.0**（V1.3 2D 转 3D / 参数化实体建模）：70 个工具，一句话即可
-「输入零件尺寸 → 自动 3D 模型 + 等轴测视图」；V1.2 的
+**当前版本 2.0.0**（V2.0 正式工业版）：79 个工具，一句话即可
+「查图纸哪里不规范、按企业模板出图、把现有 DWG 反解析成可复刻脚本、导出工程报告」；
+V1.3 的「输入零件尺寸 → 自动 3D 模型 + 等轴测视图」、V1.2 的
 「批量整理整套设备图纸 + 自动出 BOM + 自动转 PDF 交付」、V1.1 的
 「建好机械制图环境 + 画零件 + 自动标注 + 自动分层」同样一句话可达。
 迭代计划见 [docs/ROADMAP.md](docs/ROADMAP.md)，改动记录见 [CHANGELOG.md](CHANGELOG.md)。
+V1.4（中望/浩辰国产 CAD 兼容）因本机未安装、无 live 验证对象，暂缓实现。
 
 > English: [README.en.md](README.en.md)
 
@@ -65,7 +67,7 @@ AutoCAD 本身是一个桌面 GUI 程序，没有对外的 HTTP API。想在 Age
 - **依赖自举**：一键在你自己的数据目录建虚拟环境、装 pywin32/mcp/python-dotenv
 - **环境探测**：自动找出 Python 与桥目录，自动检测本机实际注册了哪些 AutoCAD ProgID
 
-### 70 个 Agent 工具
+### 79 个 Agent 工具
 
 #### 基础（V1.0，18 个，全部保留）
 
@@ -198,9 +200,36 @@ cad_zoom_extents                  → 缩放全图
 文字覆盖。自动分层开关默认关闭，只有调过
 `cad_setup_mechanical_environment` 才生效——这是刻意的向下兼容。
 
-3D 实体（`AddBox` / `AddCylinder` / `Boolean` / `Rotate3D`）目前通过
-`cad_send_command` 配合 Python 脚本使用，见 [示例](#示例)。V1.3 计划做
-原生 3D 工具，见 [ROADMAP](docs/ROADMAP.md)。
+#### V2.0 正式工业版（9 个）
+
+| 分类 | 工具 | 作用 |
+|---|---|---|
+| 合规自检 | `cad_check_drawing_compliance` | **只读**扫描全图，检出图层错误 / 标注不规范 / 未闭合轮廓 / 重复线 / 碎线 |
+| 企业模板 | `cad_list_templates` | 列出本机模板目录里的 .dwt（运行时解析路径） |
+| 企业模板 | `cad_read_drawing_standard` | 读出当前图纸的图层 / 文字样式 / 标注样式 / 线型 / 系统变量 / 活动项 |
+| 企业模板 | `cad_load_template` | 加载 .dwt 建新图（坏路径显式拒绝，不静默建普通图） |
+| 企业模板 | `cad_save_as_template` | 把当前图纸另存为 .dwt（`SaveAs(path, 14)`） |
+| 图元反解析 | `cad_reverse_engineer_drawing` | 读现有 DWG 的全部图元参数 + 制图规范（**非视觉识图**） |
+| 图元反解析 | `cad_export_reverse_script` | 导出可执行的 `CadBridge` 复刻脚本（改图 / 复刻 / 迭代闭环） |
+| 工程日志 | `cad_get_activity_log` | 查全部工具的调用流水（序号 / 成败 / 耗时 / 线程），纯内存不联网 |
+| 工程日志 | `cad_export_activity_report` | 导出 Markdown 工程工作报告 |
+
+#### 一句话做工业级交付
+
+```
+cad_check_drawing_compliance               → 图纸哪里不规范（只读，不改图）
+cad_load_template(path="企业模板.dwt")    → 按企业规范开新图
+cad_reverse_engineer_drawing              → 把现有图纸反解析成参数清单
+cad_export_reverse_script(path="replay.py") → 导出可复刻脚本
+cad_export_activity_report                → 导出工程工作报告
+```
+
+实测要点：模板目录由 `GetVariable("LOCALROOTPREFIX")+"Template"` 运行时解析；
+AutoCAD 对不存在的 .dwt 路径会**静默建普通新图**，所以 `cad_load_template`
+先校验文件存在并显式拒绝；反解析按 Slogan「非图像识别」实现为**读 DWG 图元
+元数据**，不是视觉识图；「按公司名自动匹配制图规范」需要企业自己的规范库，
+当前不实现（边界见 [docs/limitations.md](docs/limitations.md)）。工程日志在
+`_call`（全部 COM 操作的唯一通道）单点埋点，自动覆盖现在与未来的所有工具。
 
 ---
 
@@ -310,6 +339,11 @@ AutoCAD 版本与 ProgID：
 - **单实例串行**：所有 COM 调用排队经过一个 STA 线程，并发调用不会崩，但
   也不会更快——AutoCAD 本来就是单线程。
 - **不做视觉校验**：桥只管把东西画出来。画得对不对、好不好看，得另外看图。
+  V2.0 的「图纸反解析」是**读 DWG 图元元数据**（非视觉识图），合规自检也只读
+  几何与规范数据，都不看渲染像素。
+- **企业模板不做「按公司名自动匹配规范」**：`cad_read_drawing_standard` 能读出
+  一张 .dwt 里的真实规范，但「自动挑出符合某公司制度的模板」需要企业自己维护
+  规范库，当前不实现（见 [限制](docs/limitations.md)）。
 - **批量导出是串行且无事务回滚**：连续导出后 CAD 后台会忙 2~5 秒，
   `cad_batch_convert` 用加宽重试窗口兜住，但失败仍需手动清理半成品
   （见 [限制](docs/limitations.md)）。

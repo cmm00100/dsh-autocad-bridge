@@ -10,7 +10,46 @@ full backward compatibility with tools shipped in earlier versions.
 
 ## [Unreleased]
 
-### Added
+## [2.0.0] - 2026-11-09
+
+V2.0 「正式工业版」。工具数从 70 增至 **79**（新增 9 个
+`mcp__autocad__*` 工具），全部通过 live AutoCAD 2024 端到端实测
+（`tests/test_v20_industrial.py` 28/28 连跑 3 次全绿；跨版本回归
+`test_backward_compat.py` 32/32、`test_roadmap_acceptance.py` 50/50）。
+向下兼容：1.0.0/1.1.0/1.2.0/1.3.0 里所有工具名、参数与返回结构保持不变。
+用户选择「跳 V1.4（本机未装中望/浩辰）、做 V2.0 可实测部分」；按 Slogan
+「非图像识别」+ 离线硬规则，V2.0-③ 实现为**从 DWG 图元数据反解析**（读图元
+参数 → 生成可复刻的参数脚本），不是视觉识图。V1.4 国产 CAD 兼容推迟到装了
+中望/浩辰、有 live 验证对象之后。
+
+### Added — V2.0 正式工业版
+
+- **图纸合规自检引擎（V2.0-①）** 1 工具：`cad_check_drawing_compliance`。
+  只读扫描全图（不改图纸），检出 5 类问题：图层错误、标注不规范、未闭合轮廓、
+  重复线、碎线；返回 `summary{issues,errors,warnings,by_category}` 与
+  `compliant`。实测重复线用排序端点 4 位小数做键、碎线按 `min_line_length` 判定。
+- **企业标准模板系统（V2.0-②）** 4 工具：`cad_list_templates` /
+  `cad_read_drawing_standard` / `cad_load_template` / `cad_save_as_template`。
+  模板目录运行时由 `doc.GetVariable("LOCALROOTPREFIX")+"Template"` 解析（不写死
+  用户名；`TEMPLATEPATH` 本版本报 `-2145320859` 不可读）；`cad_load_template`
+  **先 `os.path.isfile` 再 `Documents.Add`** —— 实测 AutoCAD 对不存在的 .dwt
+  路径会静默建普通新图，此处已显式拒绝；建 .dwt 用 `SaveAs(path, 14)`
+  （14=ac2000_dwt）并清 `.dwl/.dwl2` 锁文件。`read_drawing_standard` 读出
+  图层/文字样式/标注样式/线型/11 个系统变量/当前活动项。边界：**不做「按公司名
+  自动猜规范」**，那需要企业自己的规范库，已在 `docs/limitations.md` 标注。
+- **DWG 图元数据反解析（V2.0-③）** 2 工具：`cad_reverse_engineer_drawing` /
+  `cad_export_reverse_script`。逐图元 `dynamic.Dispatch(ms.Item(i))` 读参数，
+  生成可执行的 `CadBridge` 复刻脚本（line/circle/arc/polyline/text/insert_block）
+  与图元清单 + 制图规范。非视觉识图，纯读 DWG 参数。
+- **任务工程化日志系统（V2.0-④）** 2 工具：`cad_get_activity_log` /
+  `cad_export_activity_report`。在 `_call`（所有 COM 操作的唯一通道）单点埋点
+  `_record_activity`，自动覆盖全部工具（含未来新增），记录序号/动作/成败/耗时/
+  线程，环形缓冲 2000 条；`cad_export_activity_report` 导出 Markdown 工程报告
+  （累计调用、失败明细、活动明细表）。日志纯内存、不联网，读日志的两个工具
+  刻意走 `bridge()` 而非 `_ensure_connected()`（不该把 CAD 拉起来）。
+
+### Added — 回归与验收资产
+
 - `tests/test_backward_compat.py`: a durable, status-independent 32-assertion
   regression that interleaves V1.0/V1.1/V1.2/V1.3 tools on one drawing and
   verifies the oldest tools still work after 3D modelling + viewport change.
@@ -24,6 +63,32 @@ full backward compatibility with tools shipped in earlier versions.
   (dimensions → 2D three views + 3D model + verified viewport switches).
   All artifacts go to `%TEMP%\dsh_roadmap_acceptance`. Recorded in
   `docs/architecture.md` and `tests/README.md`.
+- `tests/test_v20_industrial.py`: a 28-assertion V2.0 live acceptance covering
+  compliance detection (dirty vs clean drawing), .dwt save/load/reject, DWG
+  reverse-engineering script validity, and engineering-log/report export. Its
+  meta assertion checks `>=79` tools plus five generation representatives
+  instead of a hard-coded count.
+
+### Fixed — V2.0 实测暴露的真实缺陷
+
+- `load_template` 的 `Documents.Add(dwt)` 之后 CAD 会短暂 BUSY
+  （`RPC_E_CALL_REJECTED=-2147418111`），旧 `_read_drawing_standard_once` 里
+  每个集合各自 `except: pass` 把 BUSY 吞成空列表 / `sysvars[key]=None`
+  → `standard.layers=[]`、`INSUNITS=None`，偶发「custom spec survives template」
+  FAIL。改为 `_read_drawing_standard` 做 10 次**只读重试**（完备性判据
+  `layers and INSUNITS is not None`），`_coll_names` 与 `_read_drawing_standard_once`
+  把 BUSY com_error 原样抛给 wrapper；**绝不把 BUSY 抛回 `_call`**，否则整个
+  `_do()` 重跑会再次触发非幂等的 `Documents.Add`、建出重复文档。修复后连跑
+  3 次 28/28 全绿。
+- 三套回归里写死「工具数=70」的 meta 断言随版本升级失效 → 改为「>=70/>=79
+  且各代代表工具都在」，避免每次加工具就要改测试。
+
+### Changed
+
+- `MCPServer` 的 description 增加合规自检/模板/反解析/工程日志；instructions
+  增加 5 条 V2.0 约定（合规自检只读、模板坏路径显式拒绝、反解析非视觉、
+  日志不联网、doc_name）。
+- `bundle-autocad-ui/package.json` 版本升至 2.0.0。
 
 ## [1.3.0] - 2026-11-09
 

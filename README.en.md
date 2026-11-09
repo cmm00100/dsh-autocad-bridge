@@ -1,13 +1,17 @@
 # DSH AutoCAD Bridge
 
-Give **AutoCAD 2024** to a DeepSeek Harness agent as a pair of hands: query status, draw entities, manage layers, **GB-standard dimensions**, blocks with attributes, MText / geometric tolerances, mechanical aids, xrefs, auto-BOM, **batch DXF/DWG/PDF delivery** and **3D solid modelling / 2D→3D reasoning** — all through MCP tool calls. Ships with a **control panel** that owns the bridge process: start/stop/restart, settings, a status light and live logs.
+Give **AutoCAD 2024** to a DeepSeek Harness agent as a pair of hands: query status, draw entities, manage layers, **GB-standard dimensions**, blocks with attributes, MText / geometric tolerances, mechanical aids, xrefs, auto-BOM, **batch DXF/DWG/PDF delivery**, **3D solid modelling / 2D→3D reasoning**, **drawing compliance checks**, **enterprise .dwt templates**, **DWG entity reverse-engineering** and **engineering activity logs / reports** — all through MCP tool calls. Ships with a **control panel** that owns the bridge process: start/stop/restart, settings, a status light and live logs.
 
-**Current version 1.3.0** (V1.3 2D→3D / parametric solid modelling): 70 tools,
-one call to turn part dimensions into a 3D solid with an isometric view;
-V1.2's "batch-organise a whole set of equipment drawings, generate the BOM
+**Current version 2.0.0** (V2.0 industrial edition): 79 tools, one call to
+"find what is non-compliant, open a drawing from an enterprise template,
+reverse-engineer an existing DWG into a replayable script, export a work
+report". V1.3's "part dimensions → 3D solid + isometric view", V1.2's
+"batch-organise a whole set of equipment drawings, generate the BOM
 and deliver PDFs" and V1.1's "set up the drafting environment + draw +
 auto-dimension + auto-layer" are also one call each. Roadmap:
 [docs/ROADMAP.md](docs/ROADMAP.md); changes: [CHANGELOG.md](CHANGELOG.md).
+V1.4 (ZWCAD / GstarCAD compatibility) is deferred: those CAD packages are not
+installed on this machine, so there is no live target to validate against.
 
 > 中文: [README.md](README.md)
 
@@ -67,7 +71,7 @@ One sidebar icon, one full central panel:
 - **Dependency bootstrap** — builds a virtual environment in your data directory and installs pywin32 / mcp / python-dotenv on demand
 - **Discovery** — finds Python and the bridge directory, detects which AutoCAD ProgIDs your machine actually registers
 
-### 70 agent tools
+### 79 agent tools
 
 #### Base (V1.0, 18 — all kept)
 
@@ -203,9 +207,39 @@ auto-land on the "dimension" layer and accept text overrides. Auto-layering is
 off by default and only turns on after `cad_setup_mechanical_environment` — a
 deliberate backward-compatibility choice.
 
-3D solids (`AddBox` / `AddCylinder` / `Boolean` / `Rotate3D`) are driven through
-`cad_send_command` with a Python script — see [Examples](#examples). Native 3D
-tools are planned for V1.3, see [ROADMAP](docs/ROADMAP.md).
+#### V2.0 industrial edition (9)
+
+| Area | Tool | What it does |
+|---|---|---|
+| Compliance | `cad_check_drawing_compliance` | **Read-only** scan: bad layers / non-standard dimensions / open contours / duplicate lines / tiny fragments |
+| Templates | `cad_list_templates` | List .dwt files in the runtime-resolved template directory |
+| Templates | `cad_read_drawing_standard` | Read layers / text styles / dim styles / linetypes / sysvars / active items |
+| Templates | `cad_load_template` | Create a new drawing from a .dwt (bad path rejected explicitly, never silently) |
+| Templates | `cad_save_as_template` | Save the current drawing as .dwt (`SaveAs(path, 14)`) |
+| Reverse-engineer | `cad_reverse_engineer_drawing` | Read all entity parameters + drafting standard from an existing DWG (**not vision**) |
+| Reverse-engineer | `cad_export_reverse_script` | Export an executable `CadBridge` replay script |
+| Activity log | `cad_get_activity_log` | Query every tool's call stream (seq / ok / duration / thread), in-memory only |
+| Activity log | `cad_export_activity_report` | Export a Markdown engineering work report |
+
+#### One call to industrial delivery
+
+```
+cad_check_drawing_compliance                -> what's non-compliant (read-only)
+cad_load_template(path="company.dwt")       -> open from an enterprise template
+cad_reverse_engineer_drawing                -> existing DWG -> parameter inventory
+cad_export_reverse_script(path="replay.py") -> export a replayable script
+cad_export_activity_report                  -> export the engineering work report
+```
+
+Measured facts: the template directory is resolved at runtime from
+`GetVariable("LOCALROOTPREFIX")+"Template"`; AutoCAD **silently creates a
+plain new drawing** for a missing .dwt path, so `cad_load_template` checks file
+existence first and refuses explicitly. Per the slogan "non-image-recognition",
+reverse-engineering means **reading DWG entity metadata**, not visual OCR.
+"Auto-match a company's drafting rules" needs an enterprise rule library and is
+**not** implemented (see [docs/limitations.md](docs/limitations.md)). The log is
+instrumented once at `_call` (the single funnel for all COM operations), so it
+automatically covers every current and future tool.
 
 ---
 
@@ -309,7 +343,8 @@ Output lands in `examples/out/`. **Make sure AutoCAD is running and idle first**
   is the escape hatch; `cad_status` now reports queue backlog and how long the
   worker has been stuck, and `cad_reconnect` rebuilds the connection.
 - **Serial by design** — all COM calls queue through one STA thread. Concurrent calls are safe, not faster: AutoCAD itself is single-threaded.
-- **No visual verification** — the bridge draws. Whether it looks right is a separate question.
+- **No visual verification** — the bridge draws. Whether it looks right is a separate question. V2.0's "reverse-engineering" reads **DWG entity metadata** (not visual OCR) and compliance checks read geometry/standard data only; neither looks at rendered pixels.
+- **Enterprise templates do not auto-match company rules** — `cad_read_drawing_standard` reads the real standard out of a .dwt, but "pick the template matching a company's drafting policy" needs an enterprise rule library and is not implemented (see [limitations](docs/limitations.md)).
 - **Batch export is serial and has no transactional rollback** — after consecutive
   exports AutoCAD stays busy 2–5 s; `cad_batch_convert` uses a wider retry window,
   but a failed run may still leave partial output to clean up (see [limitations](docs/limitations.md)).

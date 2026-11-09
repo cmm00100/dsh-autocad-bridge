@@ -295,7 +295,13 @@ async def main():
             b = Bridge(session)
 
             names = [t.name for t in (await session.list_tools()).tools]
-            chk("[meta] tool table = 70 (V1.0+V1.1+V1.2+V1.3)", len(names) == 70, f"got {len(names)}")
+            # 三条交付标准覆盖 V1.1/V1.2/V1.3（连同 V1.0 基线共 70 工具）。
+            # 后续版本继续加工具，所以断言「至少 70 且各代代表工具都在」，不锁死数字。
+            chk("[meta] all roadmap generations registered (>=70 tools)",
+                len(names) >= 70 and all(x in names for x in (
+                    "cad_setup_mechanical_environment", "cad_batch_convert",
+                    "cad_dimensions_to_3d")),
+                f"got {len(names)}")
 
             await accept_v11(b)
             await accept_v12(b)

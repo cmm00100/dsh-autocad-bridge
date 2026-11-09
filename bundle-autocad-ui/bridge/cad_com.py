@@ -119,6 +119,15 @@ DEFAULT_LAYER_BY_KIND: dict[str, str] = {
     "hatch": "剖面线",
 }
 
+#: V2.0-④：工程活动日志环形缓冲上限。_call() 是所有 COM 操作的唯一通道，
+#: 在此单点埋点即可覆盖全部 MCP 工具（包括未来新增的），无需逐个工具改代码。
+ACTIVITY_LOG_CAPACITY = 2000
+
+#: V2.0-②：AutoCAD 另存为 .dwt 模板的 SaveAsType 枚举值（ac2000_dwt）。
+#: probe_v20d.py 实测：SaveAs(path, 14) 能生成带自定义图层/文字样式的 .dwt，
+#: 再 Documents.Add(该 dwt) 后自定义规范确实随模板存活。
+DWT_SAVEAS_TYPE = 14
+
 
 def _hresult(exc: pywintypes.com_error) -> int:
     """pywin32 的 com_error 里 hresult 有时是正数有时是负数，统一成有符号 32 位。"""
@@ -361,6 +370,13 @@ class CadBridge:
         # 默认关闭 —— 保持「省略 layer 就用 CAD 当前图层」的向下兼容行为；
         # setup_mechanical_environment() 会把它打开，实现"一句话分层规范"。
         self.auto_layer_by_kind: bool = False
+
+        # V2.0-④：工程活动日志（内存环形缓冲）。_call() 是所有 COM 操作的唯一
+        # 通道，因此在那里单点埋点即可回溯「每一步绘图」，无需逐工具改代码。
+        # 用独立锁，避免与 _lock（保护 COM 生命周期）互相争用。
+        self._activity_lock = threading.Lock()
+        self._activity_seq: int = 0
+        self._activity_log: list[dict[str, Any]] = []
 
     # -- 生命周期 ----------------------------------------------------------
 
@@ -612,7 +628,58 @@ class CadBridge:
                     raise CadError(f"{label} 失败：{exc}") from exc
             raise CadError(f"{label} 失败：{last}")
 
-        return self._on_com(_attempt, timeout_s=timeout_s)
+        # V2.0-④：单点埋点。所有 COM 操作（含未来新增工具）都经过这里，
+        # 因此一次记录即可让「每一步绘图可回溯 / 出错精准定位」覆盖全部能力。
+        t0 = time.time()
+        mono0 = time.monotonic()
+        ok = False
+        err: str | None = None
+        try:
+            result = self._on_com(_attempt, timeout_s=timeout_s)
+            ok = True
+            return result
+        except Exception as exc:  # noqa: BLE001
+            err = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            self._record_activity(
+                label=label,
+                ok=ok,
+                error=err,
+                started_at=t0,
+                duration_ms=round((time.monotonic() - mono0) * 1000.0, 2),
+            )
+
+    # -- V2.0-④ 工程活动日志 ----------------------------------------------
+
+    def _record_activity(
+        self,
+        *,
+        label: str,
+        ok: bool,
+        error: str | None,
+        started_at: float,
+        duration_ms: float,
+    ) -> None:
+        """把一次 _call 记入内存环形缓冲。任何异常都不允许影响主流程。"""
+        try:
+            with self._activity_lock:
+                self._activity_seq += 1
+                rec: dict[str, Any] = {
+                    "seq": self._activity_seq,
+                    "action": label,
+                    "ok": ok,
+                    "error": error,
+                    "ts": round(started_at, 3),
+                    "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(started_at)),
+                    "duration_ms": duration_ms,
+                    "thread": threading.get_ident(),
+                }
+                self._activity_log.append(rec)
+                if len(self._activity_log) > ACTIVITY_LOG_CAPACITY:
+                    del self._activity_log[: len(self._activity_log) - ACTIVITY_LOG_CAPACITY]
+        except Exception:  # noqa: BLE001
+            pass
 
     # -- 文档 --------------------------------------------------------------
 
@@ -2894,6 +2961,641 @@ class CadBridge:
         geom = self._call("由草图生成 3D 模型", _do)
         view = self._view_and_shade("iso", shade, doc_name)
         return {"ok": True, **geom, **view, "layer": layer, "document": self._last_doc_name}
+
+    # ======================================================================
+    # V2.0 正式工业版
+    #   ① 图纸合规自检引擎  ② 企业 .dwt 模板  ③ 图元数据反解析  ④ 工程活动日志
+    #
+    # 全部基于「读 DWG 图元数据」，不是视觉识图，也不联网：
+    # 与 ROADMAP 的 Slogan「非图像识别 / 零幻觉 / 离线」一致。
+    # 所有 COM 读操作整体塞进一个 _call 的 _do()（probe_v20b 实测：连续读
+    # 全表后 CAD 会短暂忙，单次 _call 自带 BUSY 重试最稳）。
+    # ======================================================================
+
+    @staticmethod
+    def _prop(obj: Any, name: str, default: Any = None) -> Any:
+        """安全读一个 COM 属性。属性是 attribute 访问，不是 getter 方法。"""
+        try:
+            return getattr(obj, name)
+        except Exception:  # noqa: BLE001
+            return default
+
+    @staticmethod
+    def _vec(value: Any) -> list[float] | None:
+        """把 COM SAFEARRAY/VARIANT 点或坐标转成可 JSON 化的 float 列表。"""
+        if value is None:
+            return None
+        try:
+            return [round(float(x), 6) for x in value]
+        except Exception:  # noqa: BLE001
+            return None
+
+    @staticmethod
+    def _jsonable(value: Any) -> Any:
+        """把 GetVariable 可能返回的 tuple/VARIANT 转成纯 JSON 值。"""
+        if value is None or isinstance(value, (bool, int, float, str)):
+            return value
+        try:
+            return [CadBridge._jsonable(x) for x in value]
+        except Exception:  # noqa: BLE001
+            return str(value)
+
+    @staticmethod
+    def _coll_names(coll: Any) -> list[str]:
+        """
+        枚举图元集合里每个对象的 Name。RAW 读取即可（probe_v20b 实测）。
+        BUSY com_error 原样抛出（交给 _read_drawing_standard 的只读重试），
+        其它属性错误跳过。
+        """
+        out: list[str] = []
+        try:
+            for i in range(int(coll.Count)):
+                item = coll.Item(i)
+                name = CadBridge._prop(item, "Name")
+                if name is None:
+                    name = CadBridge._prop(dynamic.Dispatch(item), "Name")
+                if name is not None:
+                    out.append(str(name))
+        except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, pywintypes.com_error) and _hresult(exc) in BUSY_HRESULTS:
+                raise
+        return out
+
+    def _read_drawing_standard(self, doc: Any) -> dict[str, Any]:
+        """
+        读当前文档的制图规范（图层/文字/标注样式/系统变量）。必须在 _do() 内调用。
+
+        ★ BUSY 自愈（V2.0 live 实测）：Documents.Add(dwt) / SaveAs 之后 AutoCAD
+        会短暂拒绝呼叫（RPC_E_CALL_REJECTED = -2147418111）。这些 COM 读错误原先
+        被逐集合的 `except: pass` 吞成空列表，导致 load_template 返回的 standard
+        偶发缺图层 / INSUNITS（tests/test_v20_industrial.py 的 flaky FAIL 根因）。
+        这里在 COM 线程内对整段「只读枚举」做有限重试，直到读到一个图层且
+        INSUNITS 可读（任何合法 DWG 都有 "0" 层，故这是安全的完备性判据）。
+        重试只在线程内重跑读取，绝不把 BUSY 抛回 _call —— 那会让 load_template
+        的 _do() 整个重跑、触发 Documents.Add 重复建图（非幂等）。
+        """
+        last: dict[str, Any] = {}
+        for _attempt in range(10):
+            try:
+                result = self._read_drawing_standard_once(doc)
+            except pywintypes.com_error as exc:
+                # 只在这里消化 BUSY：整段只读重跑，不惊动 _call，
+                # 因而绝不会让 load_template 的 Documents.Add 重跑。
+                if _hresult(exc) in BUSY_HRESULTS:
+                    time.sleep(0.4)
+                    continue
+                raise
+            last = result
+            # 完备性兜底：任何合法 DWG 都至少有 "0" 层和 INSUNITS。
+            if result["layers"] and result["sysvars"].get("INSUNITS") is not None:
+                return result
+            time.sleep(0.4)
+        last["_incomplete"] = True
+        last["_error"] = "AutoCAD 持续忙，制图规范读取不完整（请稍后重试）"
+        return last
+
+    def _read_drawing_standard_once(self, doc: Any) -> dict[str, Any]:
+        """
+        单次读取（含逐属性容错）。由 _read_drawing_standard 的 BUSY 重试循环调用。
+        ★ 集合级读取若命中 BUSY com_error 必须原样抛出，交给外层循环重跑整段读取；
+          绝不能像以前那样 `except: pass` 吞成空/半截列表（那正是 flaky 的根因）。
+          非 BUSY 的属性错误仍按缺省值容错（不同 AutoCAD 版本属性集合略有差异）。
+        """
+
+        def _busy_guard(exc: BaseException) -> None:
+            if isinstance(exc, pywintypes.com_error) and _hresult(exc) in BUSY_HRESULTS:
+                raise exc
+
+        # 就绪探针：先做两个轻量 COM 调用。刚 Documents.Add / SaveAs 之后
+        # AutoCAD 常短暂拒绝呼叫，让 BUSY 在枚举之前就暴露出来（触发外层重试）。
+        int(doc.Layers.Count)
+        doc.GetVariable("INSUNITS")
+
+        layers: list[dict[str, Any]] = []
+        try:
+            coll = doc.Layers
+            for i in range(int(coll.Count)):
+                lay = dynamic.Dispatch(coll.Item(i))
+                layers.append({
+                    "name": str(self._prop(lay, "Name", "")),
+                    "color": self._jsonable(self._prop(lay, "Color")),
+                    "lineweight": self._jsonable(self._prop(lay, "Lineweight")),
+                    "linetype": str(self._prop(lay, "Linetype", "")),
+                    "lock": bool(self._prop(lay, "Lock", False)),
+                    "freeze": bool(self._prop(lay, "Freeze", False)),
+                })
+        except Exception as exc:  # noqa: BLE001
+            _busy_guard(exc)
+
+        text_styles: list[dict[str, Any]] = []
+        try:
+            coll = doc.TextStyles
+            for i in range(int(coll.Count)):
+                st = dynamic.Dispatch(coll.Item(i))
+                text_styles.append({
+                    "name": str(self._prop(st, "Name", "")),
+                    "font": str(self._prop(st, "fontFile", "")),
+                    "bigfont": str(self._prop(st, "bigFontFile", "")),
+                })
+        except Exception as exc:  # noqa: BLE001
+            _busy_guard(exc)
+
+        sysvars: dict[str, Any] = {}
+        for key in ("INSUNITS", "MEASUREMENT", "LUNITS", "LWDISPLAY", "LTSCALE",
+                    "DIMTXT", "DIMASZ", "DIMTXSTY", "DIMLFAC", "DIMASSOC",
+                    "DWGCODEPAGE"):
+            try:
+                sysvars[key] = self._jsonable(doc.GetVariable(key))
+            except Exception as exc:  # noqa: BLE001
+                _busy_guard(exc)
+                sysvars[key] = None
+
+        active: dict[str, Any] = {}
+        for prop, out in (("ActiveDimStyle", "dim_style"),
+                          ("ActiveLayer", "layer"),
+                          ("ActiveTextStyle", "text_style")):
+            try:
+                active[out] = str(getattr(doc, prop).Name)
+            except Exception as exc:  # noqa: BLE001
+                _busy_guard(exc)
+                active[out] = None
+
+        return {
+            "layers": layers,
+            "text_styles": text_styles,
+            "dim_styles": self._coll_names(doc.DimStyles),
+            "linetypes": self._coll_names(doc.Linetypes),
+            "sysvars": sysvars,
+            "active": active,
+        }
+
+    def _read_drawing_snapshot(self, doc: Any, limit: int = 5000) -> dict[str, Any]:
+        """
+        全表读 DWG 图元参数。必须在 _call 的 _do() 内调用（已在 COM 线程）。
+        V2.0-① 合规自检与 V2.0-③ 反解析共用这一份数据，避免重复枚举。
+        """
+        ms = doc.ModelSpace
+        total = int(ms.Count)
+        n = min(total, limit) if limit and limit > 0 else total
+        entities: list[dict[str, Any]] = []
+        for i in range(n):
+            try:
+                e = dynamic.Dispatch(ms.Item(i))
+                rec: dict[str, Any] = {
+                    "index": i,
+                    "handle": str(self._prop(e, "Handle", "")),
+                    "type": str(self._prop(e, "ObjectName", "")),
+                    "layer": str(self._prop(e, "Layer", "")),
+                }
+                t = rec["type"]
+                if t == "AcDbLine":
+                    rec["start"] = self._vec(self._prop(e, "StartPoint"))
+                    rec["end"] = self._vec(self._prop(e, "EndPoint"))
+                    rec["length"] = round(float(self._prop(e, "Length", 0) or 0), 6)
+                elif "Polyline" in t:
+                    rec["closed"] = bool(self._prop(e, "Closed", False))
+                    rec["coordinates"] = self._vec(self._prop(e, "Coordinates"))
+                    rec["length"] = round(float(self._prop(e, "Length", 0) or 0), 6)
+                elif t in ("AcDbCircle", "AcDbArc"):
+                    rec["center"] = self._vec(self._prop(e, "Center"))
+                    rec["radius"] = round(float(self._prop(e, "Radius", 0) or 0), 6)
+                    if t == "AcDbArc":
+                        rec["start_angle_rad"] = round(float(self._prop(e, "StartAngle", 0) or 0), 8)
+                        rec["end_angle_rad"] = round(float(self._prop(e, "EndAngle", 0) or 0), 8)
+                elif t in ("AcDbText", "AcDbMText"):
+                    rec["text"] = str(self._prop(e, "TextString", ""))
+                    rec["height"] = round(float(self._prop(e, "Height", 0) or 0), 6)
+                    rec["style"] = str(self._prop(e, "StyleName", ""))
+                    rec["insertion"] = self._vec(self._prop(e, "InsertionPoint"))
+                elif "Dimension" in t:
+                    rec["measurement"] = round(float(self._prop(e, "Measurement", 0) or 0), 6)
+                    rec["override"] = str(self._prop(e, "TextOverride", "") or "")
+                    rec["style"] = str(self._prop(e, "StyleName", "") or "")
+                elif t == "AcDbBlockReference":
+                    rec["block"] = str(self._prop(e, "EffectiveName", ""))
+                    rec["insertion"] = self._vec(self._prop(e, "InsertionPoint"))
+                    rec["rotation"] = round(float(self._prop(e, "Rotation", 0) or 0), 8)
+                entities.append(rec)
+            except Exception as exc:  # noqa: BLE001
+                entities.append({"index": i, "type": "<unreadable>", "error": str(exc)})
+
+        histogram: dict[str, int] = {}
+        for rec in entities:
+            key = rec.get("type", "<unknown>")
+            histogram[key] = histogram.get(key, 0) + 1
+
+        return {
+            "total": total,
+            "returned": len(entities),
+            "entities": entities,
+            "histogram": histogram,
+            "standard": self._read_drawing_standard(doc),
+        }
+
+    # -- V2.0-① 图纸合规自检引擎 -------------------------------------------
+
+    def check_drawing_compliance(
+        self,
+        doc_name: str | None = None,
+        min_line_length: float = 1.0,
+        dim_layer: str = "标注",
+        text_layer: str = "文字",
+        gb_dim_style: str = "GB-机械",
+    ) -> dict[str, Any]:
+        """
+        检查：图层错误 / 标注不规范 / 未闭合轮廓 / 重复线、碎线。
+        全部按图元参数判定，不做视觉判断；返回结构化报告，不改图纸。
+        """
+
+        def _do() -> dict[str, Any]:
+            doc = self._document(doc_name)
+            snap = self._read_drawing_snapshot(doc)
+            ents = snap["entities"]
+            known_layers = {str(l["name"]) for l in snap["standard"]["layers"]}
+            std = set(GB_LAYERS) | {"0", "Defpoints"} | known_layers
+            issues: list[dict[str, Any]] = []
+
+            def add(category: str, severity: str, handle: str, detail: str) -> None:
+                issues.append({"category": category, "severity": severity,
+                               "handle": handle, "detail": detail})
+
+            lines: list[dict[str, Any]] = []
+            for e in ents:
+                t = e.get("type", "")
+                if e.get("layer") and e["layer"] not in std:
+                    add("图层错误", "warn", e.get("handle", ""),
+                        f"图元落在非标准图层 '{e['layer']}'")
+                if t == "AcDbLine":
+                    lines.append(e)
+                    if float(e.get("length") or 0) < float(min_line_length):
+                        add("碎线", "warn", e.get("handle", ""),
+                            f"直线长度 {e.get('length')} 小于阈值 {min_line_length}")
+                elif "Polyline" in t and e.get("closed") is False:
+                    add("未闭合轮廓", "error", e.get("handle", ""),
+                        "多段线轮廓未闭合，无法生成面域/拉伸")
+                elif "Dimension" in t:
+                    if e.get("layer") and dim_layer and e["layer"] != dim_layer:
+                        add("标注不规范", "warn", e.get("handle", ""),
+                            f"尺寸在图层 '{e['layer']}'，应放在 '{dim_layer}'")
+                    if e.get("override"):
+                        add("标注不规范", "warn", e.get("handle", ""),
+                            f"手工覆盖尺寸文字 '{e['override']}'，与实测值可能不符")
+                    if gb_dim_style and snap["standard"]["dim_styles"] and \
+                            gb_dim_style in snap["standard"]["dim_styles"] and \
+                            e.get("style") and e["style"] != gb_dim_style:
+                        add("标注不规范", "warn", e.get("handle", ""),
+                            f"标注样式 '{e['style']}' 不是国标样式 '{gb_dim_style}'")
+                    if float(e.get("measurement") or 0) <= 0:
+                        add("标注不规范", "error", e.get("handle", ""),
+                            "尺寸实测值 <= 0（可能是错误标注）")
+                elif t in ("AcDbText", "AcDbMText") and e.get("layer") and \
+                        text_layer and e["layer"] != text_layer:
+                    add("图层错误", "warn", e.get("handle", ""),
+                        f"文字在图层 '{e['layer']}'，应放在 '{text_layer}'")
+
+            # 重复线：端点排序后做键，坐标取 4 位小数容差
+            seen: dict[tuple, str] = {}
+            for e in lines:
+                s, en = e.get("start"), e.get("end")
+                if not s or not en:
+                    continue
+                a = (round(s[0], 4), round(s[1], 4))
+                b = (round(en[0], 4), round(en[1], 4))
+                key = tuple(sorted((a, b)))
+                if key in seen:
+                    add("重复线", "error", e.get("handle", ""),
+                        f"与句柄 {seen[key]} 的直线端点重合")
+                else:
+                    seen[key] = e.get("handle", "")
+
+            by_category: dict[str, int] = {}
+            errors = warnings = 0
+            for it in issues:
+                by_category[it["category"]] = by_category.get(it["category"], 0) + 1
+                if it["severity"] == "error":
+                    errors += 1
+                else:
+                    warnings += 1
+            return {
+                "checks": ["图层错误", "标注不规范", "未闭合轮廓", "重复线", "碎线"],
+                "entity_count": snap["total"],
+                "scanned": snap["returned"],
+                "histogram": snap["histogram"],
+                "issues": issues,
+                "summary": {"issues": len(issues), "errors": errors,
+                            "warnings": warnings, "by_category": by_category},
+                "compliant": errors == 0,
+            }
+
+        info = self._call("图纸合规自检", _do, retries=6, retry_delay_s=0.5)
+        return {"ok": True, **info, "document": self._last_doc_name}
+
+    # -- V2.0-③ 图元数据反解析（非视觉识图）-------------------------------
+
+    @staticmethod
+    def _build_replay_script(snap: dict[str, Any], document: str | None) -> str:
+        """从图元参数逆向生成可复刻的 Python 脚本（用同一 CadBridge 重建）。"""
+        lines: list[str] = [
+            "# -*- coding: utf-8 -*-",
+            "# 由 DSH AutoCAD Bridge V2.0 图元反解析自动生成（读 DWG 参数，非视觉识图）",
+            f"# 源文档：{document}",
+            f"# 图元数：{snap['returned']}（总 {snap['total']}）",
+            "# 复刻方式：读图元参数 → 用原生 COM 重建，实现「改图 / 复刻 / 迭代」闭环",
+            "",
+            "import os, sys, math",
+            "sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))",
+            "from cad_com import CadBridge",
+            "",
+            "b = CadBridge()",
+            "b.connect()",
+            "b.new_document()",
+            "",
+        ]
+        for e in snap["entities"]:
+            t = e.get("type", "")
+            lay = e.get("layer") or ""
+            arg = f", layer={lay!r}" if lay else ""
+            try:
+                if t == "AcDbLine" and e.get("start") and e.get("end"):
+                    lines.append(f"b.add_line({e['start'][:2]!r}, {e['end'][:2]!r}{arg})")
+                elif t == "AcDbCircle" and e.get("center"):
+                    lines.append(f"b.add_circle({e['center'][:2]!r}, {e.get('radius', 0)!r}{arg})")
+                elif t == "AcDbArc" and e.get("center"):
+                    sa = round(math.degrees(e.get("start_angle_rad", 0)), 6)
+                    ea = round(math.degrees(e.get("end_angle_rad", 0)), 6)
+                    lines.append(f"b.add_arc({e['center'][:2]!r}, {e.get('radius', 0)!r}, {sa!r}, {ea!r}{arg})")
+                elif "Polyline" in t and e.get("coordinates"):
+                    flat = e["coordinates"]
+                    pts = [flat[i:i + 2] for i in range(0, len(flat) - 1, 2)]
+                    lines.append(f"b.add_polyline({pts!r}, closed={bool(e.get('closed'))!r}{arg})")
+                elif t in ("AcDbText", "AcDbMText"):
+                    ins = (e.get("insertion") or [0, 0, 0])[:2]
+                    lines.append(f"b.add_text({e.get('text', '')!r}, {ins!r}, height={e.get('height', 2.5)!r}{arg})")
+                elif t == "AcDbBlockReference" and e.get("block"):
+                    ins = (e.get("insertion") or [0, 0, 0])[:2]
+                    lines.append(f"b.insert_block({e['block']!r}, {ins!r}{arg})")
+                else:
+                    lines.append(f"# TODO 未覆盖类型 {t} (handle={e.get('handle', '')})")
+            except Exception as exc:  # noqa: BLE001
+                lines.append(f"# 跳过 {t} (handle={e.get('handle', '')})：{exc}")
+        lines += ["", "b.zoom_extents()", "print('replay done')", ""]
+        return "\n".join(lines)
+
+    def reverse_engineer_drawing(
+        self,
+        doc_name: str | None = None,
+        limit: int = 5000,
+        include_script: bool = True,
+    ) -> dict[str, Any]:
+        """读取现有图纸参数 → 图元清单 + 统计 + 可复刻参数脚本（非视觉识图）。"""
+
+        def _do() -> dict[str, Any]:
+            doc = self._document(doc_name)
+            snap = self._read_drawing_snapshot(doc, limit=limit)
+            out: dict[str, Any] = {
+                "total": snap["total"],
+                "returned": snap["returned"],
+                "histogram": snap["histogram"],
+                "entities": snap["entities"],
+                "standard": snap["standard"],
+            }
+            if include_script:
+                script = self._build_replay_script(snap, self._last_doc_name)
+                out["script"] = script
+                out["script_chars"] = len(script)
+            return out
+
+        info = self._call("图元数据反解析", _do, retries=6, retry_delay_s=0.5)
+        return {"ok": True, **info, "document": self._last_doc_name}
+
+    def export_reverse_script(
+        self,
+        path: str,
+        doc_name: str | None = None,
+        limit: int = 5000,
+    ) -> dict[str, Any]:
+        """把反解析得到的复刻脚本写到磁盘（离线，仅本地文件）。"""
+        if not path:
+            raise CadError("export_reverse_script 需要 path 参数。")
+
+        def _do() -> dict[str, Any]:
+            doc = self._document(doc_name)
+            snap = self._read_drawing_snapshot(doc, limit=limit)
+            return {"_snap": snap}
+
+        info = self._call("采集图元用于参数脚本", _do, retries=6, retry_delay_s=0.5)
+        snap = info["_snap"]
+        script = self._build_replay_script(snap, self._last_doc_name)
+        target = os.path.abspath(path)
+        parent = os.path.dirname(target)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(target, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(script)
+        return {"ok": True, "path": target, "size": os.path.getsize(target),
+                "script_chars": len(script), "entities": snap["returned"],
+                "document": self._last_doc_name}
+
+    # -- V2.0-② 企业标准模板系统 -------------------------------------------
+
+    def _template_dir(self, doc: Any) -> str:
+        """运行时解析 AutoCAD 模板目录，不写死用户名（probe_v20c 实测）。"""
+        for var in ("LOCALROOTPREFIX", "ROAMABLEROOTPREFIX"):
+            try:
+                prefix = str(doc.GetVariable(var))
+            except Exception:  # noqa: BLE001
+                continue
+            if not prefix:
+                continue
+            candidate = os.path.join(prefix, "Template")
+            if os.path.isdir(candidate):
+                return candidate
+        # GetVariable("TEMPLATEPATH") 在本版本会报「获取系统变量时出错」，故不依赖它。
+        return ""
+
+    def list_templates(self, doc_name: str | None = None) -> dict[str, Any]:
+        """列出本机可用的 .dwt 模板。"""
+
+        def _do() -> dict[str, Any]:
+            doc = self._document(doc_name)
+            directory = self._template_dir(doc)
+            items: list[dict[str, Any]] = []
+            if directory:
+                for name in sorted(os.listdir(directory)):
+                    if not name.lower().endswith(".dwt"):
+                        continue
+                    full = os.path.join(directory, name)
+                    try:
+                        size = os.path.getsize(full)
+                    except OSError:
+                        size = 0
+                    items.append({"name": name, "path": full, "size": size})
+            return {"template_dir": directory, "count": len(items), "templates": items}
+
+        info = self._call("列出 DWT 模板", _do)
+        return {"ok": True, **info, "document": self._last_doc_name}
+
+    def read_drawing_standard(self, doc_name: str | None = None) -> dict[str, Any]:
+        """读取当前文档的制图规范（图层/文字/标注样式/系统变量/激活项）。"""
+
+        def _do() -> dict[str, Any]:
+            return self._read_drawing_standard(self._document(doc_name))
+
+        info = self._call("读取制图规范", _do, retries=6, retry_delay_s=0.5)
+        return {"ok": True, **info, "document": self._last_doc_name}
+
+    def load_template(self, path: str, doc_name: str | None = None) -> dict[str, Any]:
+        """
+        加载企业 .dwt 模板开新图。
+        注意（probe_v20c 实测）：Documents.Add(不存在的路径) 会**静默建出普通新图**，
+        所以这里先 os.path.isfile 显式校验并拒绝，避免 silently 得到错的图纸。
+        """
+
+        def _do() -> dict[str, Any]:
+            base = self._document(doc_name)
+            candidate = os.path.abspath(path)
+            if not os.path.isfile(candidate):
+                directory = self._template_dir(base)
+                if directory:
+                    joined = os.path.join(directory, path)
+                    if os.path.isfile(joined):
+                        candidate = joined
+            if not os.path.isfile(candidate):
+                raise CadError(
+                    f"找不到 .dwt 模板 '{path}'（且不在模板目录里）。"
+                    "先调 cad_list_templates 查看可用模板，或传绝对路径。"
+                    "注意：AutoCAD 对不存在的模板路径会静默建普通新图，此处已显式拒绝。"
+                )
+            before = int(self._app.Documents.Count)
+            newdoc = self._app.Documents.Add(candidate)
+            after = int(self._app.Documents.Count)
+            self._last_doc_name = str(self._prop(newdoc, "Name", "") or self._last_doc_name)
+            return {
+                "template": candidate,
+                "created_document": self._last_doc_name,
+                "documents_before": before,
+                "documents_after": after,
+                "standard": self._read_drawing_standard(newdoc),
+            }
+
+        info = self._call("加载 DWT 模板", _do)
+        return {"ok": True, **info, "document": self._last_doc_name}
+
+    def save_as_template(self, path: str, doc_name: str | None = None) -> dict[str, Any]:
+        """
+        把当前文档另存为企业 .dwt 模板（SaveAsType=14 / ac2000_dwt，probe_v20d 实测）。
+        自定义图层/文字样式/INSUNITS 会随模板存活。
+        边界：本工具负责「生成并加载企业模板」，不做「按公司名自动猜规范」——
+        那需要企业自己的规范库，超出离线可验证范围，见 docs/limitations.md。
+        """
+
+        def _do() -> dict[str, Any]:
+            doc = self._document(doc_name)
+            target = os.path.abspath(path)
+            if not target.lower().endswith(".dwt"):
+                target += ".dwt"
+            parent = os.path.dirname(target)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            # examples/valve-3d.py 的教训：残留 .dwl/.dwl2 锁文件会让 SaveAs 报 -2145320861
+            for suffix in (".dwl", ".dwl2"):
+                lock = target + suffix
+                if os.path.isfile(lock):
+                    try:
+                        os.remove(lock)
+                    except OSError:
+                        pass
+            doc.SaveAs(target, DWT_SAVEAS_TYPE)
+            return {"path": target,
+                    "size": os.path.getsize(target) if os.path.isfile(target) else -1}
+
+        info = self._call("另存为 DWT 模板", _do)
+        return {"ok": True, **info, "document": self._last_doc_name}
+
+    # -- V2.0-④ 工程活动日志 / 工作报告 ------------------------------------
+
+    def get_activity_log(
+        self,
+        limit: int = 100,
+        action: str = "",
+        ok_only: bool | None = None,
+    ) -> dict[str, Any]:
+        """读工程活动日志（纯内存状态，不需要连接 CAD，CAD 关掉也能查）。"""
+        with self._activity_lock:
+            recs = [dict(r) for r in self._activity_log]
+            seq = self._activity_seq
+            buffered = len(self._activity_log)
+        if action:
+            recs = [r for r in recs if action in r["action"]]
+        if ok_only is not None:
+            recs = [r for r in recs if r["ok"] == bool(ok_only)]
+        total = len(recs)
+        if limit and limit > 0:
+            recs = recs[-int(limit):]
+        succeeded = sum(1 for r in recs if r["ok"])
+        return {
+            "ok": True,
+            "seq": seq,
+            "buffered": buffered,
+            "capacity": ACTIVITY_LOG_CAPACITY,
+            "total": total,
+            "returned": len(recs),
+            "succeeded": succeeded,
+            "failed": len(recs) - succeeded,
+            "records": recs,
+        }
+
+    def export_activity_report(
+        self,
+        path: str = "",
+        doc_name: str | None = None,
+        limit: int = 2000,
+    ) -> dict[str, Any]:
+        """把工程活动日志导出成 Markdown 工作报告（离线，仅本地文件）。"""
+        log = self.get_activity_log(limit=limit)
+        recs = log["records"]
+        target = os.path.abspath(path) if path else os.path.join(
+            os.environ.get("TEMP") or os.path.expanduser("~"),
+            "dsh-activity-report.md",
+        )
+        parent = os.path.dirname(target)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
+        failed = [r for r in recs if not r["ok"]]
+        out: list[str] = [
+            "# DSH AutoCAD Bridge — 工程工作报告",
+            "",
+            f"- 生成时间：{time.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"- 当前文档：{self._last_doc_name or doc_name or '(未连接)'}",
+            f"- 累计调用：{log['seq']}（缓冲保留 {log['buffered']}/{log['capacity']}）",
+            f"- 本次报告记录：{len(recs)}，成功 {log['succeeded']}，失败 {log['failed']}",
+            "",
+            "## 失败明细",
+            "",
+        ]
+        if failed:
+            for r in failed:
+                out.append(f"- #{r['seq']} `{r['action']}` @ {r['time']} "
+                           f"({r['duration_ms']} ms)：{r['error']}")
+        else:
+            out.append("（无失败记录）")
+        out += ["", "## 活动明细", "",
+                "| # | 时间 | 动作 | 结果 | 耗时(ms) | 错误 |",
+                "|---|------|------|------|----------|------|"]
+        for r in recs:
+            err = (r["error"] or "").replace("|", "\\|").replace("\n", " ")
+            if len(err) > 160:
+                err = err[:160] + "…"
+            out.append(f"| {r['seq']} | {r['time']} | {r['action']} | "
+                       f"{'OK' if r['ok'] else 'FAIL'} | {r['duration_ms']} | {err} |")
+        out.append("")
+        text = "\n".join(out)
+        with open(target, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        return {"ok": True, "path": target, "size": os.path.getsize(target),
+                "records": len(recs), "failed": len(failed),
+                "document": self._last_doc_name or doc_name}
 
     # -- 读取 --------------------------------------------------------------
 

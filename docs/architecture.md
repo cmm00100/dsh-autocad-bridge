@@ -117,5 +117,19 @@ def _on_com(self, fn):
 | 可移植性 | `bundle-autocad-ui/findtest.mjs` | 路径发现、配置迁移、外部目录降级 |
 | 跨版本兼容 | `tests/test_backward_compat.py` | 32 项：同一张图纸混调 V1.0/V1.1/V1.2/V1.3 工具，验证旧工具在 3D+视口之后仍可用、早期图元不被改写 |
 | ROADMAP 交付验收 | `tests/test_roadmap_acceptance.py` | 50 项：把 V1.1/V1.2/V1.3 各自「一句话交付标准」编码成可重复 live 检查——三视图+6 种标注+分层 / 批量 DXF·DWG·PDF+BOM / 尺寸→2D 三视图+3D 模型+视图切换；产物真校验落盘大小 |
+| V2.0 工业能力 | `tests/test_v20_industrial.py` | 28 项：合规自检（脏图 4 类问题 / 干净图 0 问题，只读不改图）、企业 .dwt 模板（列/读规范/另存/加载并验证自定义规范存活/坏路径显式拒绝）、图元数据反解析（脚本合法且可导出）、工程活动日志与 Markdown 报告；连跑 3 次验证 BUSY 只读重试修掉了 flaky |
 
 **没有覆盖到的**：面板的真实像素渲染。原因见 [限制](limitations.md)。
+
+---
+
+## 工程日志与单点埋点（V2.0）
+
+V2.0 把「每一步绘图可回溯」做成基础设施而不是逐工具补丁：所有 COM 操作都
+经 `CadBridge._call`，因此只在 `_call` 加 `try/except/finally` 一处埋点
+（`_record_activity`），就自动覆盖现有 79 个工具以及未来新增的任何工具。
+记录 `{seq, action, ok, error, ts, time, duration_ms, thread}`，存进程内
+环形缓冲 `ACTIVITY_LOG_CAPACITY=2000`，`cad_get_activity_log` 与
+`cad_export_activity_report` 走 `bridge()` 而不是 `_ensure_connected()`
+（读日志不该把 CAD 拉起来）。离线、不上传图纸、桥重启即清零——边界见
+[限制](limitations.md)。

@@ -1,15 +1,50 @@
 # Tests
 
-## Tests
-
-Two live, status-independent acceptance scripts. Both need the bridge up on
-`127.0.0.1:8770` and the bridge's own virtualenv; both exit `0` only when
-every assertion passes; both can be run repeatedly against one warm process.
+Three live, status-independent acceptance scripts. All need the bridge up on
+`127.0.0.1:8770` and the bridge's own virtualenv; all exit `0` only when every
+assertion passes; all can be run repeatedly against one warm process.
 
 | Script | Checks | What it locks down |
 |---|---|---|
 | `test_backward_compat.py` | 32 | ROADMAP「向下兼容 / 可生产使用」：四个版本工具混调 |
 | `test_roadmap_acceptance.py` | 50 | ROADMAP 三条「一句话交付标准」逐版本 live 验收 |
+| `test_v20_industrial.py` | 28 | V2.0 工业版：合规自检 / 企业 .dwt / 图元反解析 / 工程日志 |
+
+## V2.0 industrial acceptance
+
+`test_v20_industrial.py` exercises the four V2.0 capabilities against live
+AutoCAD (see [docs/ROADMAP.md](../docs/ROADMAP.md) V2.0):
+
+- **图纸合规自检** — a deliberately dirty drawing must report 4 issues across
+  碎线 / 未闭合轮廓 / 图层错误 / 重复线; a clean drawing must report
+  `issues: 0, compliant: True`. The check is **read-only** and never edits the
+  drawing.
+- **企业 .dwt 模板** — list templates (runtime-resolved directory), read the
+  drawing standard, `save_as_template` (`SaveAs(path, 14)`), `load_template`
+  and verify a custom layer/style/INSUNITS survives the round-trip, and that a
+  **missing .dwt path is rejected explicitly** (AutoCAD would otherwise
+  silently create a plain new drawing).
+- **图元数据反解析** — `reverse_engineer_drawing` returns an entity inventory +
+  drafting standard + a valid Python replay script; `export_reverse_script`
+  writes it to disk (non-empty). This is metadata reverse-engineering, not
+  vision/OCR.
+- **工程活动日志** — `get_activity_log` grows across calls (seq / ok /
+  duration / thread, in-memory only); `export_activity_report` writes a
+  non-empty Markdown report. Reading the log must **not** wake AutoCAD up
+  (the tools go through `bridge()`, not `_ensure_connected()`).
+
+```powershell
+& "F:\DSH对CAD2024插件\bridge\.venv\Scripts\python.exe" `
+  "F:\DSH对CAD2024插件\tests\test_v20_industrial.py"
+```
+
+Expected output ends with `=== V20 LIVE: PASS=28 FAIL=0 total=28 ===`.
+Verified: three consecutive runs, 28/28 each — this is the stress test that
+proved the `load_template` BUSY read-retry fix (no more flaky
+"custom spec survives template"). Tool-count assertions are floors (`>=79`)
+plus representative-tool checks, so future versions do not break the suite.
+
+---
 
 ### ROADMAP delivery-standard acceptance
 
